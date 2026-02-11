@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub fn main() !void {
-    const input = "300 + 5 * 40";
+    const input = "1 * a2 + 5) * 40 * 9";
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -80,7 +80,7 @@ pub fn generateAsm(node: *Node) !void {
     }
 }
 
-// --- Minimal Parser ---
+// --- Parser with Pratt Algorithm for Operator Precedence ---
 
 const Node = struct {
     isOperator: bool,
@@ -90,28 +90,122 @@ const Node = struct {
     right: ?*Node,
 };
 
-const allowedOperators = [_]u8{ '+', '-', '*', '/' };
+// Binding power: higher = tighter binding
+fn getBindingPower(op: u8) usize {
+    return switch (op) {
+        '+', '-' => 1,
+        '*', '/' => 2,
+        '^' => 3,
+        else => 0,
+    };
+}
 
-// Need to add parentheses handling and operator precedence for a complete parser.
-pub fn arithmeticParse(str: []const u8, allocator: std.mem.Allocator) !*Node {
-    const root = try allocator.create(Node);
-    root.* = .{ .isOperator = false, .operator = null, .operand = null, .left = null, .right = null };
+const Parser = struct {
+    input: []const u8,
+    pos: usize,
+    allocator: std.mem.Allocator,
 
-    var i: usize = 0;
-    while (i < str.len) : (i += 1) {
-        const char = str[i];
-        if (std.mem.indexOfScalar(u8, &allowedOperators, char) != null) {
-            root.isOperator = true;
-            root.operator = char;
-            root.left = try arithmeticParse(str[0..i], allocator);
-            root.right = try arithmeticParse(str[i + 1 ..], allocator);
-            return root;
+    fn init(input: []const u8, allocator: std.mem.Allocator) Parser {
+        return .{
+            .input = input,
+            .pos = 0,
+            .allocator = allocator,
+        };
+    }
+
+    fn skipWhitespace(self: *Parser) void {
+        while (self.pos < self.input.len and std.mem.indexOfScalar(u8, " \t\n\r", self.input[self.pos]) != null) {
+            self.pos += 1;
         }
     }
 
-    if (!root.isOperator) {
-        const trimmed = std.mem.trim(u8, str, " \t\n\r");
-        root.operand = try std.fmt.parseFloat(f32, trimmed);
+    fn peek(self: *Parser) ?u8 {
+        self.skipWhitespace();
+        if (self.pos < self.input.len) {
+            return self.input[self.pos];
+        }
+        return null;
     }
-    return root;
+
+    fn consume(self: *Parser) ?u8 {
+        const ch = self.peek();
+        if (ch != null) {
+            self.pos += 1;
+        }
+        return ch;
+    }
+
+    fn parseNumber(self: *Parser) (std.mem.Allocator.Error || std.fmt.ParseFloatError || error{UnmatchedParenthesis})!*Node {
+        self.skipWhitespace();
+        const start = self.pos;
+
+        // Parse digits and decimal point
+        while (self.pos < self.input.len) {
+            const ch = self.input[self.pos];
+            if ((ch >= '0' and ch <= '9') or ch == '.') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+
+        const numStr = self.input[start..self.pos];
+        const node = try self.allocator.create(Node);
+        node.* = .{
+            .isOperator = false,
+            .operator = null,
+            .operand = try std.fmt.parseFloat(f32, numStr),
+            .left = null,
+            .right = null,
+        };
+        return node;
+    }
+
+    fn parseExpression(self: *Parser, minPower: usize) (std.mem.Allocator.Error || std.fmt.ParseFloatError || error{UnmatchedParenthesis})!*Node {
+        // Check for parenthesized expression first
+        var left: *Node = undefined;
+
+        self.skipWhitespace();
+
+        if (self.peek() == '(') {
+            _ = self.consume(); // consume '('
+            left = try self.parseExpression(0);
+            self.skipWhitespace();
+            if (self.consume() != ')') {
+                return error.UnmatchedParenthesis;
+            }
+        } else {
+            left = try self.parseNumber();
+        }
+        self.skipWhitespace();
+
+        while (self.peek()) |op| {
+            const power = getBindingPower(op);
+
+            if (power == 0 or power < minPower) {
+                break;
+            }
+            _ = self.consume(); // consume the operator
+
+            // For left-associative operators, parse right side with power + 1
+            const right = try self.parseExpression(power + 1);
+
+            const node = try self.allocator.create(Node);
+            node.* = .{
+                .isOperator = true,
+                .operator = op,
+                .operand = null,
+                .left = left,
+                .right = right,
+            };
+            left = node;
+        }
+
+        return left;
+    }
+};
+
+pub fn arithmeticParse(str: []const u8, allocator: std.mem.Allocator) !*Node {
+    var parser = Parser.init(str, allocator);
+    return parser.parseExpression(0);
 }
