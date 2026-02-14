@@ -1,13 +1,16 @@
 const std = @import("std");
 
 pub fn main() !void {
-    const input = "1 * a2 + 5) * 40 * 9";
+    const input = "2^3^2 + 5* (4 - 2)"; // Example input expression
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const root = try arithmeticParse(input, allocator);
+    const root = arithmeticParse(input, allocator) catch |err| {
+        std.debug.print("\nParsing failed with error: {}\n", .{err});
+        return err;
+    };
 
     // Assembly Header
     // We use .intel_syntax for readability.
@@ -71,6 +74,17 @@ pub fn generateAsm(node: *Node) !void {
                 std.debug.print("    cqo\n", .{}); // Sign-extend RAX into RDX for idiv
                 std.debug.print("    idiv rbx\n", .{});
             },
+            '^' => {
+                // Exponentiation: rax^rbx -> result in rax using pow() function
+                // Convert base (rax) to XMM0 for pow() call
+                std.debug.print("    cvtsi2sd xmm0, rax      # Convert base to double\n", .{});
+                // Convert exponent (rbx) to XMM1 for pow() call
+                std.debug.print("    cvtsi2sd xmm1, rbx      # Convert exponent to double\n", .{});
+                // Call pow function
+                std.debug.print("    call pow@PLT\n", .{});
+                // Result is in xmm0, convert back to integer
+                std.debug.print("    cvttsd2si rax, xmm0     # Convert result back to integer\n", .{});
+            },
             else => unreachable,
         }
     } else {
@@ -98,6 +112,10 @@ fn getBindingPower(op: u8) usize {
         '^' => 3,
         else => 0,
     };
+}
+
+fn isRightAssociative(op: u8) bool {
+    return op == '^'; // Exponentiation is right-associative
 }
 
 const Parser = struct {
@@ -135,7 +153,7 @@ const Parser = struct {
         return ch;
     }
 
-    fn parseNumber(self: *Parser) (std.mem.Allocator.Error || std.fmt.ParseFloatError || error{UnmatchedParenthesis})!*Node {
+    fn parseNumber(self: *Parser) (std.mem.Allocator.Error || std.fmt.ParseFloatError || error{ UnmatchedParenthesis, UnexpectedCharacter })!*Node {
         self.skipWhitespace();
         const start = self.pos;
 
@@ -150,18 +168,27 @@ const Parser = struct {
         }
 
         const numStr = self.input[start..self.pos];
+        if (numStr.len == 0) {
+            const ch = self.peek() orelse 0;
+            std.debug.print("\nSyntax Error: Expected a number but found '{c}' at position {d}\n", .{ ch, self.pos });
+            return error.UnexpectedCharacter;
+        }
+
         const node = try self.allocator.create(Node);
         node.* = .{
             .isOperator = false,
             .operator = null,
-            .operand = try std.fmt.parseFloat(f32, numStr),
+            .operand = std.fmt.parseFloat(f32, numStr) catch |err| {
+                std.debug.print("\nSyntax Error: Invalid number format '{s}' at position {d}\n", .{ numStr, start });
+                return err;
+            },
             .left = null,
             .right = null,
         };
         return node;
     }
 
-    fn parseExpression(self: *Parser, minPower: usize) (std.mem.Allocator.Error || std.fmt.ParseFloatError || error{UnmatchedParenthesis})!*Node {
+    fn parseExpression(self: *Parser, minPower: usize) (std.mem.Allocator.Error || std.fmt.ParseFloatError || error{ UnmatchedParenthesis, UnexpectedCharacter })!*Node {
         // Check for parenthesized expression first
         var left: *Node = undefined;
 
@@ -172,6 +199,7 @@ const Parser = struct {
             left = try self.parseExpression(0);
             self.skipWhitespace();
             if (self.consume() != ')') {
+                std.debug.print("\nSyntax Error: Expected closing ')' at position {d}\n", .{self.pos});
                 return error.UnmatchedParenthesis;
             }
         } else {
@@ -187,8 +215,9 @@ const Parser = struct {
             }
             _ = self.consume(); // consume the operator
 
-            // For left-associative operators, parse right side with power + 1
-            const right = try self.parseExpression(power + 1);
+            // Right-associative operators use same power, left-associative use power + 1
+            const nextMinPower = if (isRightAssociative(op)) power else power + 1;
+            const right = try self.parseExpression(nextMinPower);
 
             const node = try self.allocator.create(Node);
             node.* = .{
