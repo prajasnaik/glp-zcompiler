@@ -1,102 +1,6 @@
 const std = @import("std");
 
-pub fn main() !void {
-    const input = "2^3^2 + 5* (4 - 2)"; // Example input expression
-
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const root = arithmeticParse(input, allocator) catch |err| {
-        std.debug.print("\nParsing failed with error: {}\n", .{err});
-        return err;
-    };
-
-    // Assembly Header
-    // We use .intel_syntax for readability.
-    // We use .globl main so GCC can find the entry point.
-    std.debug.print(
-        \\    .intel_syntax noprefix
-        \\    .section .rodata
-        \\fmt:
-        \\    .string "Result: %ld\n"
-        \\
-        \\    .section .text
-        \\    .globl main
-        \\
-        \\main:
-        \\    push rbp
-        \\    mov rbp, rsp
-        \\
-    , .{});
-
-    // Generate the math instructions
-    try generateAsm(root);
-
-    // Assembly Footer
-    // Result is in RAX. We move it to RSI for printf.
-    std.debug.print(
-        \\    lea rdi, [rip + fmt]    # First arg: format string
-        \\    mov rsi, rax            # Second arg: result
-        \\    xor eax, eax            # printf expects 0 in EAX for varargs
-        \\    call printf@PLT
-        \\
-        \\    mov eax, 0              # Return 0
-        \\    pop rbp
-        \\    ret
-        \\
-    , .{});
-}
-
-pub fn generateAsm(node: *Node) !void {
-    if (node.isOperator) {
-        // 1. Process left side
-        if (node.left) |left| {
-            try generateAsm(left);
-            std.debug.print("    push rax\n", .{});
-        }
-
-        // 2. Process right side
-        if (node.right) |right| {
-            try generateAsm(right);
-        }
-
-        // 3. Move right result to rbx, retrieve left from stack into rax
-        std.debug.print("    mov rbx, rax\n", .{});
-        std.debug.print("    pop rax\n", .{});
-
-        // 4. Perform math
-        switch (node.operator.?) {
-            '+' => std.debug.print("    add rax, rbx\n", .{}),
-            '-' => std.debug.print("    sub rax, rbx\n", .{}),
-            '*' => std.debug.print("    imul rax, rbx\n", .{}),
-            '/' => {
-                std.debug.print("    cqo\n", .{}); // Sign-extend RAX into RDX for idiv
-                std.debug.print("    idiv rbx\n", .{});
-            },
-            '^' => {
-                // Exponentiation: rax^rbx -> result in rax using pow() function
-                // Convert base (rax) to XMM0 for pow() call
-                std.debug.print("    cvtsi2sd xmm0, rax      # Convert base to double\n", .{});
-                // Convert exponent (rbx) to XMM1 for pow() call
-                std.debug.print("    cvtsi2sd xmm1, rbx      # Convert exponent to double\n", .{});
-                // Call pow function
-                std.debug.print("    call pow@PLT\n", .{});
-                // Result is in xmm0, convert back to integer
-                std.debug.print("    cvttsd2si rax, xmm0     # Convert result back to integer\n", .{});
-            },
-            else => unreachable,
-        }
-    } else {
-        // Leaf node: just load the number
-        const val = @as(i64, @intFromFloat(node.operand.?));
-        std.debug.print("    mov rax, {d}\n", .{val});
-    }
-}
-
-// --- Parser with Pratt Algorithm for Operator Precedence ---
-
-const Node = struct {
+pub const Node = struct {
     isOperator: bool,
     operator: ?u8,
     operand: ?f32,
@@ -118,12 +22,12 @@ fn isRightAssociative(op: u8) bool {
     return op == '^'; // Exponentiation is right-associative
 }
 
-const Parser = struct {
+pub const Parser = struct {
     input: []const u8,
     pos: usize,
     allocator: std.mem.Allocator,
 
-    fn init(input: []const u8, allocator: std.mem.Allocator) Parser {
+    pub fn init(input: []const u8, allocator: std.mem.Allocator) Parser {
         return .{
             .input = input,
             .pos = 0,
