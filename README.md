@@ -29,7 +29,7 @@ This is a repo for a new programming language with difference equations as the t
 Clone the repository:
 
 ```sh
-git clone https://github.com/<your-org>/glp-zcompiler.git
+git clone https://github.com/prajasnaik/glp-zcompiler.git
 cd glp-zcompiler
 ```
 
@@ -42,7 +42,7 @@ zig build
 Run the compiler (only file name can be specified right now; support for paths will be added):
 
 ```sh
-./zig-out/bin/glp_zcompiler <filename.s>
+./zig-out/bin/glp-zcompiler <filename.s>
 ```
 
 Compile the generated assembly file:
