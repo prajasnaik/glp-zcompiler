@@ -3,17 +3,32 @@ const Node = @import("parser.zig").Node;
 
 pub const AsmGenerator = struct {
     writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    variables: std.StringHashMap(i32),
+    stack_offset: i32,
 
-    pub fn init(writer: *std.Io.Writer) !AsmGenerator {
+    pub fn init(writer: *std.Io.Writer, allocator: std.mem.Allocator) !AsmGenerator {
         return .{
             .writer = writer,
+            .allocator = allocator,
+            .variables = std.StringHashMap(i32).init(allocator),
+            .stack_offset = 0,
         };
     }
 
+    pub fn deinit(self: *AsmGenerator) void {
+        self.variables.deinit();
+    }
+
     pub fn generate(self: *AsmGenerator, root: *Node) !void {
+        std.debug.print("[asm] generate: starting with root type={s}\n", .{@tagName(root.node_type)});
+        std.debug.print("[asm] generate: writing header...\n", .{});
         try self.printHeader();
-        try self.generateExpression(root);
+        std.debug.print("[asm] generate: writing body...\n", .{});
+        try self.generateNode(root);
+        std.debug.print("[asm] generate: writing footer...\n", .{});
         try self.printFooter();
+        std.debug.print("[asm] generate: done\n", .{});
     }
 
     fn printHeader(self: *AsmGenerator) !void {
@@ -32,6 +47,7 @@ pub const AsmGenerator = struct {
             \\main:
             \\    push rbp
             \\    mov rbp, rsp
+            \\    sub rsp, 256
             \\
         , .{});
     }
@@ -45,56 +61,89 @@ pub const AsmGenerator = struct {
             \\    xor eax, eax            # printf expects 0 in EAX for varargs
             \\    call printf@PLT
             \\
-            \\    mov eax, 0              # Return 0
-            \\    pop rbp
+            \\    xor eax, eax            # Return 0
+            \\    leave
             \\    ret
             \\
         , .{});
     }
 
-    fn generateExpression(self: *AsmGenerator, node: *Node) !void {
-        if (node.isOperator) {
-            // 1. Process left side
-            if (node.left) |left| {
-                try self.generateExpression(left);
-                try self.writer.print("    push rax\n", .{});
-            }
+    fn generateNode(self: *AsmGenerator, node: *Node) !void {
+        std.debug.print("[asm] generateNode: type={s}", .{@tagName(node.node_type)});
+        switch (node.node_type) {
+            .assignment => std.debug.print(" name='{s}'", .{node.name orelse "<null>"}),
+            .variable => std.debug.print(" name='{s}'", .{node.name orelse "<null>"}),
+            .number => std.debug.print(" value={d}", .{node.operand orelse 0}),
+            .binary_op => std.debug.print(" op='{c}'", .{node.operator orelse '?'}),
+            .block => std.debug.print(" stmts={d}", .{if (node.statements) |s| s.len else 0}),
+        }
+        std.debug.print("\n", .{});
 
-            // 2. Process right side
-            if (node.right) |right| {
-                try self.generateExpression(right);
-            }
+        switch (node.node_type) {
+            .block => {
+                if (node.statements) |stmts| {
+                    std.debug.print("[asm]   block: processing {d} statement(s)\n", .{stmts.len});
+                    for (stmts, 0..) |stmt, i| {
+                        std.debug.print("[asm]   block: statement [{d}]\n", .{i});
+                        try self.generateNode(stmt);
+                    }
+                } else {
+                    std.debug.print("[asm]   block: WARNING - no statements!\n", .{});
+                }
+            },
+            .assignment => {
+                std.debug.print("[asm]   assignment: evaluating RHS for '{s}'\n", .{node.name orelse "<null>"});
+                // Evaluate the right-hand side expression
+                try self.generateNode(node.left.?);
+                // Allocate stack slot and store result
+                self.stack_offset += 8;
+                try self.variables.put(node.name.?, self.stack_offset);
+                std.debug.print("[asm]   assignment: '{s}' stored at [rbp - {d}]\n", .{ node.name orelse "<null>", self.stack_offset });
+                try self.writer.print("    mov [rbp - {d}], rax\n", .{self.stack_offset});
+            },
+            .variable => {
+                const offset = self.variables.get(node.name.?).?;
+                std.debug.print("[asm]   variable: '{s}' loaded from [rbp - {d}]\n", .{ node.name orelse "<null>", offset });
+                try self.writer.print("    mov rax, [rbp - {d}]\n", .{offset});
+            },
+            .binary_op => {
+                // 1. Process left side
+                if (node.left) |left| {
+                    try self.generateNode(left);
+                    try self.writer.print("    push rax\n", .{});
+                }
 
-            // 3. Move right result to rbx, retrieve left from stack into rax
-            try self.writer.print("    mov rbx, rax\n", .{});
-            try self.writer.print("    pop rax\n", .{});
+                // 2. Process right side
+                if (node.right) |right| {
+                    try self.generateNode(right);
+                }
 
-            // 4. Perform math
-            switch (node.operator.?) {
-                '+' => try self.writer.print("    add rax, rbx\n", .{}),
-                '-' => try self.writer.print("    sub rax, rbx\n", .{}),
-                '*' => try self.writer.print("    imul rax, rbx\n", .{}),
-                '/' => {
-                    try self.writer.print("    cqo\n", .{}); // Sign-extend RAX into RDX for idiv
-                    try self.writer.print("    idiv rbx\n", .{});
-                },
-                '^' => {
-                    // Exponentiation: rax^rbx -> result in rax using pow() function
-                    // Convert base (rax) to XMM0 for pow() call
-                    try self.writer.print("    cvtsi2sd xmm0, rax      # Convert base to double\n", .{});
-                    // Convert exponent (rbx) to XMM1 for pow() call
-                    try self.writer.print("    cvtsi2sd xmm1, rbx      # Convert exponent to double\n", .{});
-                    // Call pow function
-                    try self.writer.print("    call pow@PLT\n", .{});
-                    // Result is in xmm0, convert back to integer
-                    try self.writer.print("    cvttsd2si rax, xmm0     # Convert result back to integer\n", .{});
-                },
-                else => unreachable,
-            }
-        } else {
-            // Leaf node: just load the number
-            const val = @as(i64, @intFromFloat(node.operand.?));
-            try self.writer.print("    mov rax, {d}\n", .{val});
+                // 3. Move right result to rbx, retrieve left from stack into rax
+                try self.writer.print("    mov rbx, rax\n", .{});
+                try self.writer.print("    pop rax\n", .{});
+
+                // 4. Perform math
+                switch (node.operator.?) {
+                    '+' => try self.writer.print("    add rax, rbx\n", .{}),
+                    '-' => try self.writer.print("    sub rax, rbx\n", .{}),
+                    '*' => try self.writer.print("    imul rax, rbx\n", .{}),
+                    '/' => {
+                        try self.writer.print("    cqo\n", .{});
+                        try self.writer.print("    idiv rbx\n", .{});
+                    },
+                    '^' => {
+                        try self.writer.print("    cvtsi2sd xmm0, rax      # Convert base to double\n", .{});
+                        try self.writer.print("    cvtsi2sd xmm1, rbx      # Convert exponent to double\n", .{});
+                        try self.writer.print("    call pow@PLT\n", .{});
+                        try self.writer.print("    cvttsd2si rax, xmm0     # Convert result back to integer\n", .{});
+                    },
+                    else => unreachable,
+                }
+            },
+            .number => {
+                const val = @as(i64, @intFromFloat(node.operand.?));
+                try self.writer.print("    mov rax, {d}\n", .{val});
+            },
         }
     }
 };
