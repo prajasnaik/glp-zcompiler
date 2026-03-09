@@ -27,21 +27,17 @@ pub fn main() !void {
     var file_writer = file.writer(&file_buf);
     const writer = &file_writer.interface;
 
-    // Test: arithmetic, booleans (!false, and), comparison, if-else, final expression
-    // Expected output: x + y = 10 + 4 = 14
-    // Trace: z = (10 > 4) and !false = true and true = true
-    //        if (true) -> a = 10 * 2 = 20  [inner, not printed]
-    //        final result: x + y = 14
+    // Final printed value: x  =>  Expected output: Result: 13
     const input =
-        \\x = 10
-        \\y = 4
-        \\z = x > y and !false
-        \\if (z) {
-        \\    a = x * 2
-        \\} else {
-        \\    a = y + 1
+        \\a = 10
+        \\r = 1
+        \\y = 2
+        \\n = 5
+        \\while (y < n) {
+        \\    a` = a + a * r
+        \\    y` = y + 1
         \\}
-        \\x + y
+        \\a
     ;
 
     std.debug.print("\n===== GLP ZCompiler Debug =====\n", .{});
