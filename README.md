@@ -6,10 +6,10 @@ This is a repo for a new programming language with difference equations as the t
 
 - [ ] float-native operation support. So the output is not converted to int before printing.
 - [ ] support for file paths rather than just file names
-- [ ] handling assignments using symbol table
-- [ ] building conditionals
-- [ ] building while loop
-- [ ] adding ' operator for difference equation logic
+- [x] handling assignments using symbol table
+- [x] building conditionals
+- [x] building while loop
+- [x] adding ' operator for difference equation logic
 - [ ] function support
 
 ## Prerequisites
