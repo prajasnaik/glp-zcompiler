@@ -16,36 +16,30 @@ pub const LiteralValue = union(enum) {
     null_val: void,
 };
 
-pub const NodeData = union(enum) {
-    literal: LiteralValue,
-    variable: []const u8,
-
-    binary: struct {
-        op: TokenType,
-        left: *Node,
-        right: *Node,
-    },
-
-    assignment: struct {
-        target: []const u8,
-        value: *Node,
-    },
-
-    block: struct {
-        statements: []const *Node,
-    },
-
-    unary: struct {
-        op: TokenType,
-        operand: *Node,
-    },
-
-    if_statement: struct {
-        condition: *Node,
-        then_branch: *Node,
-        else_branch: ?*Node,
-    },
-};
+pub const NodeData = union(enum) { literal: LiteralValue, variable: []const u8, binary: struct {
+    op: TokenType,
+    left: *Node,
+    right: *Node,
+}, assignment: struct {
+    target: []const u8,
+    value: *Node,
+}, block: struct {
+    statements: []const *Node,
+}, unary: struct {
+    op: TokenType,
+    operand: *Node,
+}, if_statement: struct {
+    condition: *Node,
+    then_branch: *Node,
+    else_branch: ?*Node,
+}, while_loop: struct {
+    condition: *Node,
+    body: *Node,
+    prime_vars: []const []const u8,
+}, prime_assignment: struct {
+    target: []const u8,
+    value: *Node,
+} };
 
 pub const Node = struct {
     span: Span,
@@ -120,12 +114,35 @@ fn isRightAssociative(op: TokenType) bool {
     return op == .caret;
 }
 
+/// Walk `node` and collect every unique `prime_assignment` target name into `list`.
+/// Stops descending into nested `while_loop` nodes — they collect their own prime_vars.
+fn collectPrimeVars(node: *Node, list: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
+    switch (node.data) {
+        .prime_assignment => |pa| {
+            for (list.items) |existing| {
+                if (std.mem.eql(u8, existing, pa.target)) return; // deduplicate
+            }
+            try list.append(allocator, pa.target);
+        },
+        .block => |b| {
+            for (b.statements) |stmt| try collectPrimeVars(stmt, list, allocator);
+        },
+        .if_statement => |s| {
+            try collectPrimeVars(s.then_branch, list, allocator);
+            if (s.else_branch) |eb| try collectPrimeVars(eb, list, allocator);
+        },
+        // Nested while_loop: its prime_vars are managed by its own node — do not descend.
+        else => {},
+    }
+}
+
 pub const Parser = struct {
     lexer: Lexer,
     allocator: std.mem.Allocator,
     symbols: SymbolTable,
     current: Token,
     peek_token: Token,
+    loop_depth: usize,
     /// Set to the offending token whenever a parse error is returned.
     error_token: Token,
 
@@ -139,6 +156,7 @@ pub const Parser = struct {
             .symbols = try SymbolTable.init(allocator),
             .current = first,
             .peek_token = second,
+            .loop_depth = 0,
             .error_token = .{ .token_type = .eof, .lexeme = "", .start = 0, .end = 0 },
         };
     }
@@ -271,6 +289,39 @@ pub const Parser = struct {
             return node;
         }
 
+        if (self.current.token_type == .identifier and self.peek_token.token_type == .prime) {
+            const target_token = self.current;
+            self.advance(); // consume identifier
+            self.advance(); // consume '`'
+
+            if (self.loop_depth == 0) {
+                self.error_token = target_token;
+                return error.PrimeOutsideLoop;
+            }
+            if (self.symbols.isDefined(target_token.lexeme) == false) {
+                self.error_token = target_token;
+                return error.UndefinedVariable;
+            }
+
+            if (self.current.token_type == .equal) {
+                self.advance(); // consume '='
+            } else {
+                self.error_token = self.current;
+                return error.ExpectedEqualAfterPrime;
+            }
+
+            const value = try self.parseExpression(0);
+
+            const node = try self.allocator.create(Node);
+            node.* = .{
+                .span = .{ .start = target_token.start, .end = value.span.end },
+                .data = .{ .prime_assignment = .{ .target = target_token.lexeme, .value = value } },
+            };
+
+            if (self.current.token_type == .newline) self.advance();
+            return node;
+        }
+
         if (self.current.token_type == .kw_if) {
             const token_start = self.current.start;
             self.advance(); // consume 'if'
@@ -308,6 +359,36 @@ pub const Parser = struct {
             return node;
         }
 
+        if (self.current.token_type == .kw_while) {
+            const token_start = self.current.start;
+            self.advance(); // consume 'while'
+
+            if (self.current.token_type != .l_paren) return error.ExpectedWhileCondition;
+            self.advance(); // consume '('
+            const condition = try self.parseExpression(0);
+            if (self.current.token_type != .r_paren) return error.UnmatchedParenthesis;
+            self.advance(); // consume ')'
+            self.loop_depth += 1;
+            const body = try self.parseStatement() orelse return error.ExpectedWhileBody;
+            self.loop_depth -= 1;
+
+            var prime_var_list: std.ArrayList([]const u8) = .empty;
+            try collectPrimeVars(body, &prime_var_list, self.allocator);
+            const prime_vars = try prime_var_list.toOwnedSlice(self.allocator);
+
+            const node = try self.allocator.create(Node);
+            node.* = .{
+                .span = .{ .start = token_start, .end = body.span.end },
+                .data = .{
+                    .while_loop = .{
+                        .condition = condition,
+                        .body = body,
+                        .prime_vars = prime_vars,
+                    },
+                },
+            };
+            return node;
+        }
         const expr = try self.parseExpression(0);
         if (self.current.token_type == .newline) self.advance();
         return expr;

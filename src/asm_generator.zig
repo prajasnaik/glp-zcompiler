@@ -5,6 +5,7 @@ pub const AsmGenerator = struct {
     writer: *std.Io.Writer, // Keeping your custom interface definition
     allocator: std.mem.Allocator,
     variables: std.StringHashMap(i32),
+    prime_slots: std.StringHashMap(i32),
     stack_offset: i32,
     label_counter: u32,
 
@@ -13,6 +14,7 @@ pub const AsmGenerator = struct {
             .writer = writer,
             .allocator = allocator,
             .variables = std.StringHashMap(i32).init(allocator),
+            .prime_slots = std.StringHashMap(i32).init(allocator),
             .stack_offset = 0,
             .label_counter = 0,
         };
@@ -20,6 +22,7 @@ pub const AsmGenerator = struct {
 
     pub fn deinit(self: *AsmGenerator) void {
         self.variables.deinit();
+        self.prime_slots.deinit();
     }
 
     pub fn generate(self: *AsmGenerator, root: *Node) !void {
@@ -47,7 +50,7 @@ pub const AsmGenerator = struct {
             \\main:
             \\    push rbp
             \\    mov rbp, rsp
-            \\    sub rsp, 256
+            \\    sub rsp, 512
             \\
         , .{});
     }
@@ -83,6 +86,8 @@ pub const AsmGenerator = struct {
             .block => |b| std.debug.print(" stmts={d}", .{b.statements.len}),
             .unary => |u| std.debug.print(" op='{s}'", .{@tagName(u.op)}),
             .if_statement => std.debug.print(" (if statement)", .{}),
+            .while_loop => |wl| std.debug.print(" prime_vars={d}", .{wl.prime_vars.len}),
+            .prime_assignment => |pa| std.debug.print(" target='{s}'", .{pa.target}),
         }
         std.debug.print("\n", .{});
 
@@ -236,6 +241,58 @@ pub const AsmGenerator = struct {
                     try self.generateNode(if_stmt.then_branch);
                     try self.writer.print(".Lend_{d}:\n", .{label_id});
                 }
+            },
+            .while_loop => |wl| {
+                const label_id = self.label_counter;
+                self.label_counter += 1;
+
+                // Allocate a fresh stack slot for every prime variable (the "new" value copy).
+                // The original slot in `variables` is the "old" value and is never written
+                // during body execution — only swapped in at the end of each iteration.
+                for (wl.prime_vars) |name| {
+                    self.stack_offset += 8;
+                    try self.prime_slots.put(name, self.stack_offset);
+                    std.debug.print("[asm]   while_loop: prime slot for '{s}' at [rbp - {d}]\n", .{ name, self.stack_offset });
+                }
+
+                try self.writer.print(".Lloop_start_{d}:\n", .{label_id});
+
+                // Evaluate condition — always reads from old slots via `variables`.
+                try self.generateNode(wl.condition);
+                try self.writer.print("    cmp rax, 0\n", .{});
+                try self.writer.print("    je .Lloop_end_{d}\n", .{label_id});
+
+                // Generate body.
+                // • `.variable` reads use `variables` (old slots) — unchanged.
+                // • `.prime_assignment` writes go to `prime_slots` (new slots).
+                try self.generateNode(wl.body);
+
+                // Simultaneous update: copy every new slot into its corresponding old slot.
+                // This is what gives difference-equation semantics: all RHS expressions
+                // in the body saw the *same* old values, regardless of assignment order.
+                for (wl.prime_vars) |name| {
+                    const old_offset = self.variables.get(name).?;
+                    const new_offset = self.prime_slots.get(name).?;
+                    try self.writer.print("    mov rax, [rbp - {d}]\n", .{new_offset});
+                    try self.writer.print("    mov [rbp - {d}], rax\n", .{old_offset});
+                }
+
+                try self.writer.print("    jmp .Lloop_start_{d}\n", .{label_id});
+                try self.writer.print(".Lloop_end_{d}:\n", .{label_id});
+
+                // Release prime slots for this loop so they don't alias a future loop.
+                for (wl.prime_vars) |name| {
+                    _ = self.prime_slots.remove(name);
+                }
+            },
+            .prime_assignment => |pa| {
+                std.debug.print("[asm]   prime_assignment: evaluating RHS for '{s}'\n", .{pa.target});
+                // Evaluate RHS — variable reads resolve to old slots (variables map is untouched).
+                try self.generateNode(pa.value);
+                // Store result into the prime (new) slot only.
+                const new_offset = self.prime_slots.get(pa.target).?;
+                std.debug.print("[asm]   prime_assignment: '{s}' -> [rbp - {d}]\n", .{ pa.target, new_offset });
+                try self.writer.print("    mov [rbp - {d}], rax\n", .{new_offset});
             },
         }
     }
