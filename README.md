@@ -4,8 +4,8 @@ This is a repo for a new programming language with difference equations as the t
 
 ## Next Steps (TODOs)
 
-- [ ] float-native operation support. So the output is not converted to int before printing.
-- [ ] support for file paths rather than just file names
+- [x] float-native operation support. So the output is not converted to int before printing.
+- [x] support for file paths rather than just file names
 - [x] handling assignments using symbol table
 - [x] building conditionals
 - [x] building while loop
@@ -33,26 +33,32 @@ git clone https://github.com/prajasnaik/glp-zcompiler.git
 cd glp-zcompiler
 ```
 
-Build the assembly file:
+Build the compiler:
 
 ```sh
 zig build
 ```
 
-Run the compiler (only file name can be specified right now; support for paths will be added):
+Run the compiler with an input source file and an output path:
 
 ```sh
-./zig-out/bin/glp-zcompiler <filename.s>
+./zig-out/bin/glp_zcompiler <input.dpl> -o <path/to/output.s>
 ```
 
-Compile the generated assembly file:
+The output directory must already exist. For example, using the provided samples:
 
 ```sh
-gcc <filename.s> -o <filename> -lm
+./zig-out/bin/glp_zcompiler samples/09_fibonacci.dpl -o outputs/fibonacci.s
+```
+
+Compile the generated assembly into an executable:
+
+```sh
+gcc outputs/fibonacci.s -o outputs/fibonacci -lm
 ```
 
 Run the executable:
 
 ```sh
-./<filename>
+./outputs/fibonacci
 ```
