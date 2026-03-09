@@ -1,7 +1,6 @@
 const std = @import("std");
-const Parser = @import("parser.zig").Parser;
-const arithmeticParse = @import("parser.zig").arithmeticParse;
-const programParse = @import("parser.zig").programParse;
+const parser_module = @import("parser.zig");
+const programParse = parser_module.programParse;
 const AsmGenerator = @import("asm_generator.zig").AsmGenerator;
 
 pub fn main() !void {
@@ -23,8 +22,9 @@ pub fn main() !void {
     // Open output file
     const file = try std.fs.cwd().createFile(output_path, .{});
     defer file.close();
-    var stdout_buf: [1024]u8 = undefined;
-    var file_writer = file.writer(&stdout_buf);
+
+    var file_buf: [4096]u8 = undefined;
+    var file_writer = file.writer(&file_buf);
     const writer = &file_writer.interface;
 
     const input =
@@ -46,21 +46,28 @@ pub fn main() !void {
         std.debug.print("\n[main] Parsing FAILED with error: {}\n", .{err});
         return err;
     };
-    std.debug.print("[main] Parsing succeeded. Root node type: {s}\n", .{@tagName(root.node_type)});
-    if (root.statements) |stmts| {
-        std.debug.print("[main] Program has {d} top-level statement(s)\n", .{stmts.len});
-    } else {
-        std.debug.print("[main] WARNING: Root node has no statements!\n", .{});
+
+    // Switch over the tagged union directly
+    std.debug.print("[main] Parsing succeeded. Root node type: {s}\n", .{@tagName(root.*)});
+    switch (root.*) {
+        .block => |b| {
+            std.debug.print("[main] Program has {d} top-level statement(s)\n", .{b.statements.len});
+        },
+        else => {
+            std.debug.print("[main] WARNING: Root node is not a block!\n", .{});
+        },
     }
 
-    // Generate assembly with header, body, and footer
+    // Generate assembly
     std.debug.print("[main] Initializing assembly generator...\n", .{});
     var generator = try AsmGenerator.init(writer, arena_allocator);
     defer generator.deinit();
+
     std.debug.print("[main] Generating assembly...\n", .{});
     try generator.generate(root);
 
     std.debug.print("[main] Flushing buffered writer...\n", .{});
+    // With the new 0.15.1 Writer interface, flush() is a method on the writer directly.
     writer.flush() catch |err| {
         std.debug.print("[main] ERROR: flush failed: {}\n", .{err});
         return err;
