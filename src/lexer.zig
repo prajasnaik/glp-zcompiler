@@ -5,7 +5,7 @@ pub const TokenType = enum {
     number,
     identifier,
 
-    // Operators
+    // Binary Operators
     plus,
     minus,
     star,
@@ -14,11 +14,14 @@ pub const TokenType = enum {
     equal,
     equal_equal,
     not_equal,
-    bang,
     lt,
     gt,
     lt_equal,
     gt_equal,
+
+    // Unary Operators
+    bang,
+    prime,
 
     // Grouping
     l_paren,
@@ -145,6 +148,10 @@ pub const Lexer = struct {
                     return self.makeToken(.not_equal, start);
                 }
                 return self.makeToken(.bang, start);
+            },
+            '`' => {
+                self.pos += 1;
+                return self.makeToken(.prime, start);
             },
             else => {},
         }
