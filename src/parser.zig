@@ -122,12 +122,14 @@ pub const Parser = struct {
 
     pub fn init(input: []const u8, allocator: std.mem.Allocator) !Parser {
         var lexer = Lexer.init(input);
+        const first = lexer.next();
+        const second = lexer.next();
         return .{
             .lexer = lexer,
             .allocator = allocator,
             .symbols = try SymbolTable.init(allocator),
-            .current = lexer.next(),
-            .peek_token = lexer.next(),
+            .current = first,
+            .peek_token = second,
         };
     }
 
