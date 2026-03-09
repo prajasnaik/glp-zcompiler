@@ -6,6 +6,7 @@ pub const AsmGenerator = struct {
     allocator: std.mem.Allocator,
     variables: std.StringHashMap(i32),
     stack_offset: i32,
+    label_counter: u32,
 
     pub fn init(writer: *std.Io.Writer, allocator: std.mem.Allocator) !AsmGenerator {
         return .{
@@ -13,6 +14,7 @@ pub const AsmGenerator = struct {
             .allocator = allocator,
             .variables = std.StringHashMap(i32).init(allocator),
             .stack_offset = 0,
+            .label_counter = 0,
         };
     }
 
@@ -79,6 +81,7 @@ pub const AsmGenerator = struct {
             },
             .binary => |b| std.debug.print(" op='{s}'", .{@tagName(b.op)}), // .binary_op -> .binary, .operator -> .op
             .block => |b| std.debug.print(" stmts={d}", .{b.statements.len}),
+            .unary => |u| std.debug.print(" op='{s}'", .{@tagName(u.op)}),
             .if_statement => std.debug.print(" (if statement)", .{}),
         }
         std.debug.print("\n", .{});
@@ -128,6 +131,58 @@ pub const AsmGenerator = struct {
                         try self.writer.print("    call pow@PLT\n", .{});
                         try self.writer.print("    cvttsd2si rax, xmm0     # Convert result back to integer\n", .{});
                     },
+                    // Comparison operators
+                    .equal_equal => {
+                        try self.writer.print("    cmp rax, rbx\n", .{});
+                        try self.writer.print("    sete al\n", .{});
+                        try self.writer.print("    movzx rax, al\n", .{});
+                    },
+                    .not_equal => {
+                        try self.writer.print("    cmp rax, rbx\n", .{});
+                        try self.writer.print("    setne al\n", .{});
+                        try self.writer.print("    movzx rax, al\n", .{});
+                    },
+                    .lt => {
+                        try self.writer.print("    cmp rax, rbx\n", .{});
+                        try self.writer.print("    setl al\n", .{});
+                        try self.writer.print("    movzx rax, al\n", .{});
+                    },
+                    .gt => {
+                        try self.writer.print("    cmp rax, rbx\n", .{});
+                        try self.writer.print("    setg al\n", .{});
+                        try self.writer.print("    movzx rax, al\n", .{});
+                    },
+                    .lt_equal => {
+                        try self.writer.print("    cmp rax, rbx\n", .{});
+                        try self.writer.print("    setle al\n", .{});
+                        try self.writer.print("    movzx rax, al\n", .{});
+                    },
+                    .gt_equal => {
+                        try self.writer.print("    cmp rax, rbx\n", .{});
+                        try self.writer.print("    setge al\n", .{});
+                        try self.writer.print("    movzx rax, al\n", .{});
+                    },
+                    // Logical operators (bitwise on 0/1 truth values)
+                    .kw_and => {
+                        // Normalize both to 0/1, then AND
+                        try self.writer.print("    test rax, rax\n", .{});
+                        try self.writer.print("    setne al\n", .{});
+                        try self.writer.print("    movzx rax, al\n", .{});
+                        try self.writer.print("    test rbx, rbx\n", .{});
+                        try self.writer.print("    setne cl\n", .{});
+                        try self.writer.print("    and al, cl\n", .{});
+                        try self.writer.print("    movzx rax, al\n", .{});
+                    },
+                    .kw_or => {
+                        // Normalize both to 0/1, then OR
+                        try self.writer.print("    test rax, rax\n", .{});
+                        try self.writer.print("    setne al\n", .{});
+                        try self.writer.print("    movzx rax, al\n", .{});
+                        try self.writer.print("    test rbx, rbx\n", .{});
+                        try self.writer.print("    setne cl\n", .{});
+                        try self.writer.print("    or al, cl\n", .{});
+                        try self.writer.print("    movzx rax, al\n", .{});
+                    },
                     else => unreachable,
                 }
             },
@@ -137,15 +192,50 @@ pub const AsmGenerator = struct {
                         const int_val = @as(i64, @intFromFloat(val)); // Note: val is f64 now (from new parser)
                         try self.writer.print("    mov rax, {d}\n", .{int_val});
                     },
+                    .boolean => |val| {
+                        const int_val: i64 = if (val) 1 else 0;
+                        try self.writer.print("    mov rax, {d}\n", .{int_val});
+                    },
                     else => {
-                        // For when you add booleans/strings, handle them here!
                         std.debug.print("Code Generation for this literal type is not implemented yet.\n", .{});
                         unreachable;
                     },
                 }
             },
-            .if_statement => {
-                std.debug.print("Code generation for if statements is not implemented yet.\n", .{});
+            .unary => |u| {
+                try self.generateNode(u.operand);
+                switch (u.op) {
+                    .bang => {
+                        // Logical NOT: if rax == 0 then 1, else 0
+                        try self.writer.print("    cmp rax, 0\n", .{});
+                        try self.writer.print("    sete al\n", .{});
+                        try self.writer.print("    movzx rax, al\n", .{});
+                    },
+                    else => unreachable,
+                }
+            },
+            .if_statement => |if_stmt| {
+                const label_id = self.label_counter;
+                self.label_counter += 1;
+
+                // Evaluate the condition — result goes into rax
+                try self.generateNode(if_stmt.condition);
+                try self.writer.print("    cmp rax, 0\n", .{});
+
+                if (if_stmt.else_branch) |else_branch| {
+                    // if-else: jump to else on false, fall through to then
+                    try self.writer.print("    je .Lelse_{d}\n", .{label_id});
+                    try self.generateNode(if_stmt.then_branch);
+                    try self.writer.print("    jmp .Lend_{d}\n", .{label_id});
+                    try self.writer.print(".Lelse_{d}:\n", .{label_id});
+                    try self.generateNode(else_branch);
+                    try self.writer.print(".Lend_{d}:\n", .{label_id});
+                } else {
+                    // if without else: jump past then-branch on false
+                    try self.writer.print("    je .Lend_{d}\n", .{label_id});
+                    try self.generateNode(if_stmt.then_branch);
+                    try self.writer.print(".Lend_{d}:\n", .{label_id});
+                }
             },
         }
     }

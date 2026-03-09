@@ -35,7 +35,11 @@ pub const NodeData = union(enum) {
         statements: []const *Node,
     },
 
-    // Ready for you to implement later!
+    unary: struct {
+        op: TokenType,
+        operand: *Node,
+    },
+
     if_statement: struct {
         condition: *Node,
         then_branch: *Node,
@@ -102,9 +106,12 @@ pub const SymbolTable = struct {
 
 fn getBindingPower(op: TokenType) usize {
     return switch (op) {
-        .plus, .minus => 1,
-        .star, .slash => 2,
-        .caret => 3,
+        .kw_or => 1,
+        .kw_and => 2,
+        .equal_equal, .not_equal, .lt, .gt, .lt_equal, .gt_equal => 3,
+        .plus, .minus => 4,
+        .star, .slash => 5,
+        .caret => 6,
         else => 0,
     };
 }
@@ -119,6 +126,8 @@ pub const Parser = struct {
     symbols: SymbolTable,
     current: Token,
     peek_token: Token,
+    /// Set to the offending token whenever a parse error is returned.
+    error_token: Token,
 
     pub fn init(input: []const u8, allocator: std.mem.Allocator) !Parser {
         var lexer = Lexer.init(input);
@@ -130,6 +139,7 @@ pub const Parser = struct {
             .symbols = try SymbolTable.init(allocator),
             .current = first,
             .peek_token = second,
+            .error_token = .{ .token_type = .eof, .lexeme = "", .start = 0, .end = 0 },
         };
     }
 
@@ -148,7 +158,10 @@ pub const Parser = struct {
         if (token.token_type == .l_paren) {
             self.advance();
             const expr = try self.parseExpression(0);
-            if (self.current.token_type != .r_paren) return error.UnmatchedParenthesis;
+            if (self.current.token_type != .r_paren) {
+                self.error_token = self.current;
+                return error.UnmatchedParenthesis;
+            }
 
             // Expand the span to include the parentheses
             expr.span.start = token.start;
@@ -159,7 +172,10 @@ pub const Parser = struct {
         }
 
         if (token.token_type == .identifier) {
-            if (!self.symbols.isDefined(token.lexeme)) return error.UndefinedVariable;
+            if (!self.symbols.isDefined(token.lexeme)) {
+                self.error_token = token;
+                return error.UndefinedVariable;
+            }
 
             const node = try self.allocator.create(Node);
             node.* = .{
@@ -180,6 +196,28 @@ pub const Parser = struct {
             return node;
         }
 
+        if (token.token_type == .kw_true or token.token_type == .kw_false) {
+            const node = try self.allocator.create(Node);
+            node.* = .{
+                .span = .{ .start = token.start, .end = token.end },
+                .data = .{ .literal = .{ .boolean = token.token_type == .kw_true } },
+            };
+            self.advance();
+            return node;
+        }
+
+        if (token.token_type == .bang) {
+            self.advance(); // consume '!'
+            const operand = try self.parseAtom();
+            const node = try self.allocator.create(Node);
+            node.* = .{
+                .span = .{ .start = token.start, .end = operand.span.end },
+                .data = .{ .unary = .{ .op = .bang, .operand = operand } },
+            };
+            return node;
+        }
+
+        self.error_token = self.current;
         return error.UnexpectedToken;
     }
 
@@ -230,6 +268,43 @@ pub const Parser = struct {
             };
 
             if (self.current.token_type == .newline) self.advance();
+            return node;
+        }
+
+        if (self.current.token_type == .kw_if) {
+            const token_start = self.current.start;
+            self.advance(); // consume 'if'
+
+            if (self.current.token_type != .l_paren) return error.ExpectedIfCondition;
+            self.advance(); // consume '('
+            const condition = try self.parseExpression(0);
+            if (self.current.token_type != .r_paren) return error.UnmatchedParenthesis;
+            self.advance(); // consume ')'
+
+            // --- Branches ---
+            const then_branch = try self.parseStatement() orelse return error.ExpectedThenStatement;
+
+            var else_branch: ?*Node = null;
+            var end_pos = then_branch.span.end;
+
+            if (self.current.token_type == .kw_else) {
+                self.advance(); // consume 'else'
+                const else_stmt = try self.parseStatement() orelse return error.ExpectedElseStatement;
+                else_branch = else_stmt;
+                end_pos = else_stmt.span.end; // Update the end position
+            }
+
+            const node = try self.allocator.create(Node);
+            node.* = .{
+                .span = .{ .start = token_start, .end = end_pos },
+                .data = .{
+                    .if_statement = .{
+                        .condition = condition,
+                        .then_branch = then_branch,
+                        .else_branch = else_branch,
+                    },
+                },
+            };
             return node;
         }
 
@@ -319,7 +394,26 @@ pub fn programParse(input: []const u8, backing_allocator: std.mem.Allocator) !Pa
     defer parser.deinit(); // Cleans up the SymbolTable's internal structures
 
     // 3. Parse the entire syntax tree.
-    const root = try parser.parseProgram();
+    const root = parser.parseProgram() catch |err| {
+        // Walk the input to find line/column of the offending token
+        const tok = parser.error_token;
+        var line: usize = 1;
+        var col: usize = 1;
+        for (input[0..@min(tok.start, input.len)]) |c| {
+            if (c == '\n') {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        const lexeme = if (tok.lexeme.len > 0) tok.lexeme else "<end of input>";
+        std.debug.print(
+            "\nParse error [{s}] at line {d}, col {d}: '{s}'\n",
+            .{ @errorName(err), line, col, lexeme },
+        );
+        return err;
+    };
 
     // 4. Return the AST struct containing both the root node AND the arena holding its memory.
     return ParsedAst{
