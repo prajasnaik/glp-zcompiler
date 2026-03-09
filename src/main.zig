@@ -8,80 +8,102 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Parse command line arguments
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    if (args.len < 2) {
-        std.debug.print("Usage: {s} <output_file>\n", .{args[0]});
-        return;
+    // ── Argument parsing ──────────────────────────────────────
+    // Expected form:  glp-zcompiler <input.dpl> -o <output.s>
+    var input_path: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "-o")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("error: -o requires an argument\n", .{});
+                std.debug.print("Usage: {s} <input.dpl> -o <output.s>\n", .{args[0]});
+                return error.MissingOutputPath;
+            }
+            output_path = args[i];
+        } else {
+            if (input_path != null) {
+                std.debug.print("error: unexpected argument '{s}'\n", .{args[i]});
+                std.debug.print("Usage: {s} <input.dpl> -o <output.s>\n", .{args[0]});
+                return error.UnexpectedArgument;
+            }
+            input_path = args[i];
+        }
     }
 
-    const output_path = args[1];
+    if (input_path == null or output_path == null) {
+        std.debug.print("Usage: {s} <input.dpl> -o <output.s>\n", .{args[0]});
+        return error.MissingArguments;
+    }
 
-    // Open output file
-    const file = try std.fs.cwd().createFile(output_path, .{});
-    defer file.close();
+    const in_path = input_path.?;
+    const out_path = output_path.?;
+
+    // ── Validate output directory exists ─────────────────────
+    if (std.fs.path.dirname(out_path)) |dir| {
+        if (dir.len > 0) {
+            std.fs.cwd().access(dir, .{}) catch {
+                std.debug.print("error: output directory '{s}' does not exist\n", .{dir});
+                return error.OutputDirectoryNotFound;
+            };
+        }
+    }
+
+    // ── Read input file ───────────────────────────────────────
+    const input_file = std.fs.cwd().openFile(in_path, .{}) catch |err| {
+        std.debug.print("error: could not open input file '{s}': {s}\n", .{ in_path, @errorName(err) });
+        return err;
+    };
+    defer input_file.close();
+
+    const input = input_file.readToEndAlloc(allocator, 16 * 1024 * 1024) catch |err| {
+        std.debug.print("error: could not read input file '{s}': {s}\n", .{ in_path, @errorName(err) });
+        return err;
+    };
+    defer allocator.free(input);
+
+    // ── Open output file ──────────────────────────────────────
+    const out_file = std.fs.cwd().createFile(out_path, .{}) catch |err| {
+        std.debug.print("error: could not create output file '{s}': {s}\n", .{ out_path, @errorName(err) });
+        return err;
+    };
+    defer out_file.close();
 
     var file_buf: [4096]u8 = undefined;
-    var file_writer = file.writer(&file_buf);
+    var file_writer = out_file.writer(&file_buf);
     const writer = &file_writer.interface;
 
-    // Final printed value: x  =>  Expected output: Result: 13
-    const input =
-        \\a = 10
-        \\r = 1
-        \\y = 2
-        \\n = 5
-        \\while (y < n) {
-        \\    a` = a + a * r
-        \\    y` = y + 1
-        \\}
-        \\a
-    ;
+    // ── Compile ───────────────────────────────────────────────
+    std.debug.print("\n===== GLP ZCompiler =====\n", .{});
+    std.debug.print("[main] Input:  {s}\n", .{in_path});
+    std.debug.print("[main] Output: {s}\n", .{out_path});
+    std.debug.print("[main] Source ({d} bytes):\n---\n{s}\n---\n", .{ input.len, input });
 
-    std.debug.print("\n===== GLP ZCompiler Debug =====\n", .{});
-    std.debug.print("[main] Output path: {s}\n", .{output_path});
-    std.debug.print("[main] Input program ({d} bytes):\n---\n{s}\n---\n", .{ input.len, input });
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const arena_allocator = arena.allocator();
-
-    std.debug.print("[main] Starting parser...\n", .{});
-
+    std.debug.print("[main] Parsing...\n", .{});
     var ast = try programParse(input, allocator);
-
     defer ast.deinit();
 
-    // 3. Access the root node using `ast.root`, and get its type using `.data`
-    std.debug.print("[main] Parsing succeeded. Root node type: {s}\n", .{@tagName(ast.root.data)});
-
+    std.debug.print("[main] Parsed OK. Root: {s}\n", .{@tagName(ast.root.data)});
     switch (ast.root.data) {
-        .block => |b| {
-            std.debug.print("[main] Program has {d} top-level statement(s)\n", .{b.statements.len});
-        },
-        else => {
-            std.debug.print("[main] WARNING: Root node is not a block!\n", .{});
-        },
+        .block => |b| std.debug.print("[main] {d} top-level statement(s)\n", .{b.statements.len}),
+        else => std.debug.print("[main] WARNING: root is not a block\n", .{}),
     }
 
-    // Generate assembly
-    std.debug.print("[main] Initializing assembly generator...\n", .{});
-    var generator = try AsmGenerator.init(writer, arena_allocator);
-    defer generator.deinit();
-
     std.debug.print("[main] Generating assembly...\n", .{});
+    var generator = try AsmGenerator.init(writer, allocator);
+    defer generator.deinit();
     try generator.generate(ast.root);
 
-    std.debug.print("[main] Flushing buffered writer...\n", .{});
-    // With the new 0.15.1 Writer interface, flush() is a method on the writer directly.
     writer.flush() catch |err| {
         std.debug.print("[main] ERROR: flush failed: {}\n", .{err});
         return err;
     };
 
-    std.debug.print("[main] Assembly generation complete.\n", .{});
-    std.debug.print("[main] Assembly written to {s}\n", .{output_path});
-    std.debug.print("===== Done =====\n\n", .{});
+    std.debug.print("[main] Done. Assembly written to {s}\n", .{out_path});
+    std.debug.print("=========================\n\n", .{});
 }
