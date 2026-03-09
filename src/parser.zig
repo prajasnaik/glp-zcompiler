@@ -10,7 +10,8 @@ pub const Span = struct {
 };
 
 pub const LiteralValue = union(enum) {
-    number: f64,
+    int: i64,
+    float: f64,
     boolean: bool,
     string: []const u8,
     null_val: void,
@@ -49,7 +50,8 @@ pub const Node = struct {
 // ─── 2. Symbol Table ─────────────────────────────────────────
 
 pub const DataType = enum {
-    number,
+    int,
+    float,
     boolean,
     string,
 };
@@ -170,6 +172,44 @@ pub const Parser = struct {
         self.peek_token = self.lexer.next();
     }
 
+    /// Infer the DataType of an expression node (best-effort; defaults to .int for unknowns).
+    fn inferType(self: *const Parser, node: *const Node) DataType {
+        return switch (node.data) {
+            .literal => |lit| switch (lit) {
+                .int => .int,
+                .float => .float,
+                .boolean => .boolean,
+                .string => .string,
+                .null_val => .int,
+            },
+            .variable => |name| blk: {
+                var i = self.symbols.scopes.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (self.symbols.scopes.items[i].get(name)) |t| break :blk t;
+                }
+                break :blk .int;
+            },
+            .binary => |b| blk: {
+                // Comparison/logical ops always produce boolean (stored as int 0/1)
+                switch (b.op) {
+                    .equal_equal, .not_equal, .lt, .gt, .lt_equal, .gt_equal, .kw_and, .kw_or => break :blk .int,
+                    else => {},
+                }
+                // Arithmetic: float if either operand is float
+                const lt = self.inferType(b.left);
+                const rt = self.inferType(b.right);
+                break :blk if (lt == .float or rt == .float) .float else .int;
+            },
+            .unary => .int, // bang produces 0/1
+            .assignment => |a| self.inferType(a.value),
+            .prime_assignment => |pa| self.inferType(pa.value),
+            .block => .int,
+            .if_statement => .int,
+            .while_loop => .int,
+        };
+    }
+
     fn parseAtom(self: *Parser) anyerror!*Node {
         const token = self.current;
 
@@ -206,9 +246,15 @@ pub const Parser = struct {
 
         if (token.token_type == .number) {
             const node = try self.allocator.create(Node);
+            // Determine if this is an integer or float literal
+            const is_float = std.mem.indexOfScalar(u8, token.lexeme, '.') != null;
+            const lit: LiteralValue = if (is_float)
+                .{ .float = try std.fmt.parseFloat(f64, token.lexeme) }
+            else
+                .{ .int = try std.fmt.parseInt(i64, token.lexeme, 10) };
             node.* = .{
                 .span = .{ .start = token.start, .end = token.end },
-                .data = .{ .literal = .{ .number = try std.fmt.parseFloat(f64, token.lexeme) } },
+                .data = .{ .literal = lit },
             };
             self.advance();
             return node;
@@ -277,7 +323,8 @@ pub const Parser = struct {
             self.advance(); // consume '='
 
             const value = try self.parseExpression(0);
-            try self.symbols.define(target_token.lexeme, .number);
+            const val_type = self.inferType(value);
+            try self.symbols.define(target_token.lexeme, val_type);
 
             const node = try self.allocator.create(Node);
             node.* = .{
