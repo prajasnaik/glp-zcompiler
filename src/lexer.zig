@@ -12,6 +12,13 @@ pub const TokenType = enum {
     slash,
     caret,
     equal,
+    equal_equal,
+    not_equal,
+    bang,
+    lt,
+    gt,
+    lt_equal,
+    gt_equal,
 
     // Grouping
     l_paren,
@@ -23,6 +30,15 @@ pub const TokenType = enum {
     newline,
     eof,
     invalid,
+
+    // Keywords
+    kw_true,
+    kw_false,
+    kw_if,
+    kw_else,
+    kw_and,
+    kw_or,
+    kw_while,
 };
 
 pub const Token = struct {
@@ -84,6 +100,10 @@ pub const Lexer = struct {
             },
             '=' => {
                 self.pos += 1;
+                if (self.pos < self.input.len and self.input[self.pos] == '=') {
+                    self.pos += 1;
+                    return self.makeToken(.equal_equal, start);
+                }
                 return self.makeToken(.equal, start);
             },
             '(' => {
@@ -102,11 +122,43 @@ pub const Lexer = struct {
                 self.pos += 1;
                 return self.makeToken(.r_brace, start);
             },
+            '<' => {
+                self.pos += 1;
+                if (self.pos < self.input.len and self.input[self.pos] == '=') {
+                    self.pos += 1;
+                    return self.makeToken(.lt_equal, start);
+                }
+                return self.makeToken(.lt, start);
+            },
+            '>' => {
+                self.pos += 1;
+                if (self.pos < self.input.len and self.input[self.pos] == '=') {
+                    self.pos += 1;
+                    return self.makeToken(.gt_equal, start);
+                }
+                return self.makeToken(.gt, start);
+            },
+            '!' => {
+                self.pos += 1;
+                if (self.pos < self.input.len and self.input[self.pos] == '=') {
+                    self.pos += 1;
+                    return self.makeToken(.not_equal, start);
+                }
+                return self.makeToken(.bang, start);
+            },
             else => {},
         }
 
         if (isAlpha(ch)) {
             while (self.pos < self.input.len and isAlnum(self.input[self.pos])) self.pos += 1;
+            const lexeme = self.input[start..self.pos];
+            if (std.mem.eql(u8, lexeme, "true")) return self.makeToken(.kw_true, start);
+            if (std.mem.eql(u8, lexeme, "false")) return self.makeToken(.kw_false, start);
+            if (std.mem.eql(u8, lexeme, "if")) return self.makeToken(.kw_if, start);
+            if (std.mem.eql(u8, lexeme, "else")) return self.makeToken(.kw_else, start);
+            if (std.mem.eql(u8, lexeme, "and")) return self.makeToken(.kw_and, start);
+            if (std.mem.eql(u8, lexeme, "or")) return self.makeToken(.kw_or, start);
+            if (std.mem.eql(u8, lexeme, "while")) return self.makeToken(.kw_while, start);
             return self.makeToken(.identifier, start);
         }
 
