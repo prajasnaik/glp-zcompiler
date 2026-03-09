@@ -42,14 +42,15 @@ pub fn main() !void {
     const arena_allocator = arena.allocator();
 
     std.debug.print("[main] Starting parser...\n", .{});
-    const root = programParse(input, arena_allocator) catch |err| {
-        std.debug.print("\n[main] Parsing FAILED with error: {}\n", .{err});
-        return err;
-    };
 
-    // Switch over the tagged union directly
-    std.debug.print("[main] Parsing succeeded. Root node type: {s}\n", .{@tagName(root.*)});
-    switch (root.*) {
+    var ast = try programParse(input, allocator);
+
+    defer ast.deinit();
+
+    // 3. Access the root node using `ast.root`, and get its type using `.data`
+    std.debug.print("[main] Parsing succeeded. Root node type: {s}\n", .{@tagName(ast.root.data)});
+
+    switch (ast.root.data) {
         .block => |b| {
             std.debug.print("[main] Program has {d} top-level statement(s)\n", .{b.statements.len});
         },
@@ -64,7 +65,7 @@ pub fn main() !void {
     defer generator.deinit();
 
     std.debug.print("[main] Generating assembly...\n", .{});
-    try generator.generate(root);
+    try generator.generate(ast.root);
 
     std.debug.print("[main] Flushing buffered writer...\n", .{});
     // With the new 0.15.1 Writer interface, flush() is a method on the writer directly.

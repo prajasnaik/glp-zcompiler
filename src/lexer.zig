@@ -28,6 +28,8 @@ pub const TokenType = enum {
 pub const Token = struct {
     token_type: TokenType,
     lexeme: []const u8,
+    start: usize, // <-- Added for Span
+    end: usize, // <-- Added for Span
 };
 
 pub const Lexer = struct {
@@ -35,97 +37,95 @@ pub const Lexer = struct {
     pos: usize,
 
     pub fn init(input: []const u8) Lexer {
-        return .{
-            .input = input,
-            .pos = 0,
-        };
+        return .{ .input = input, .pos = 0 };
     }
 
     pub fn next(self: *Lexer) Token {
-        // Skip horizontal whitespace (spaces and tabs)
         while (self.pos < self.input.len and (self.input[self.pos] == ' ' or self.input[self.pos] == '\t')) {
             self.pos += 1;
         }
 
         if (self.pos >= self.input.len) {
-            return .{ .token_type = .eof, .lexeme = "" };
+            return .{ .token_type = .eof, .lexeme = "", .start = self.pos, .end = self.pos };
         }
 
         const start = self.pos;
         const ch = self.input[self.pos];
 
-        // Single-character tokens and newlines
         switch (ch) {
             '\n' => {
                 self.pos += 1;
-                return .{ .token_type = .newline, .lexeme = self.input[start..self.pos] };
+                return self.makeToken(.newline, start);
             },
             '\r' => {
                 self.pos += 1;
                 if (self.pos < self.input.len and self.input[self.pos] == '\n') self.pos += 1;
-                return .{ .token_type = .newline, .lexeme = self.input[start..self.pos] };
+                return self.makeToken(.newline, start);
             },
             '+' => {
                 self.pos += 1;
-                return .{ .token_type = .plus, .lexeme = self.input[start..self.pos] };
+                return self.makeToken(.plus, start);
             },
             '-' => {
                 self.pos += 1;
-                return .{ .token_type = .minus, .lexeme = self.input[start..self.pos] };
+                return self.makeToken(.minus, start);
             },
             '*' => {
                 self.pos += 1;
-                return .{ .token_type = .star, .lexeme = self.input[start..self.pos] };
+                return self.makeToken(.star, start);
             },
             '/' => {
                 self.pos += 1;
-                return .{ .token_type = .slash, .lexeme = self.input[start..self.pos] };
+                return self.makeToken(.slash, start);
             },
             '^' => {
                 self.pos += 1;
-                return .{ .token_type = .caret, .lexeme = self.input[start..self.pos] };
+                return self.makeToken(.caret, start);
             },
             '=' => {
                 self.pos += 1;
-                return .{ .token_type = .equal, .lexeme = self.input[start..self.pos] };
+                return self.makeToken(.equal, start);
             },
             '(' => {
                 self.pos += 1;
-                return .{ .token_type = .l_paren, .lexeme = self.input[start..self.pos] };
+                return self.makeToken(.l_paren, start);
             },
             ')' => {
                 self.pos += 1;
-                return .{ .token_type = .r_paren, .lexeme = self.input[start..self.pos] };
+                return self.makeToken(.r_paren, start);
             },
             '{' => {
                 self.pos += 1;
-                return .{ .token_type = .l_brace, .lexeme = self.input[start..self.pos] };
+                return self.makeToken(.l_brace, start);
             },
             '}' => {
                 self.pos += 1;
-                return .{ .token_type = .r_brace, .lexeme = self.input[start..self.pos] };
+                return self.makeToken(.r_brace, start);
             },
             else => {},
         }
 
-        // Identifiers
         if (isAlpha(ch)) {
-            while (self.pos < self.input.len and isAlnum(self.input[self.pos])) {
-                self.pos += 1;
-            }
-            return .{ .token_type = .identifier, .lexeme = self.input[start..self.pos] };
+            while (self.pos < self.input.len and isAlnum(self.input[self.pos])) self.pos += 1;
+            return self.makeToken(.identifier, start);
         }
 
-        // Numbers
         if (isDigit(ch) or ch == '.') {
-            while (self.pos < self.input.len and (isDigit(self.input[self.pos]) or self.input[self.pos] == '.')) {
-                self.pos += 1;
-            }
-            return .{ .token_type = .number, .lexeme = self.input[start..self.pos] };
+            while (self.pos < self.input.len and (isDigit(self.input[self.pos]) or self.input[self.pos] == '.')) self.pos += 1;
+            return self.makeToken(.number, start);
         }
 
         self.pos += 1;
-        return .{ .token_type = .invalid, .lexeme = self.input[start..self.pos] };
+        return self.makeToken(.invalid, start);
+    }
+
+    fn makeToken(self: *Lexer, token_type: TokenType, start: usize) Token {
+        return .{
+            .token_type = token_type,
+            .lexeme = self.input[start..self.pos],
+            .start = start,
+            .end = self.pos,
+        };
     }
 
     fn isAlpha(c: u8) bool {
