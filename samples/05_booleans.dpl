@@ -1,0 +1,9 @@
+t = true
+f = false
+
+both = t and f
+either = t or f
+not_t = !t
+not_f = !f
+
+either

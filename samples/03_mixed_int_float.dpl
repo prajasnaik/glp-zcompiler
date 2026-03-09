@@ -1,0 +1,7 @@
+a = 10
+b = 3
+
+mixed = a + 0.5
+scaled = b * 2.0
+
+scaled

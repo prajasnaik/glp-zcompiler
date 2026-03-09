@@ -1,0 +1,12 @@
+x = 1.0
+dt = 0.1
+v = 2.5
+steps = 0
+n = 10
+
+while (steps < n) {
+    x` = x + v * dt
+    steps` = steps + 1
+}
+
+x

@@ -1,0 +1,6 @@
+result = 2 + 3 * 4
+parens = (2 + 3) * 4
+power = 2 ^ 3 ^ 2
+neg_chain = 10 - 3 - 2
+
+power

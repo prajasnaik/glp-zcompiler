@@ -1,0 +1,18 @@
+x = 1
+
+outer = 0
+inner = 0
+i = 0
+j = 0
+
+while (i < 3) {
+    j = 0
+    while (j < 3) {
+        inner` = inner + 1
+        j` = j + 1
+    }
+    outer` = outer + 1
+    i` = i + 1
+}
+
+inner

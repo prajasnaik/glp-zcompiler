@@ -1,0 +1,10 @@
+x = 7
+result = 0
+
+if (x > 5) {
+    result = 1
+} else {
+    result = 0
+}
+
+result

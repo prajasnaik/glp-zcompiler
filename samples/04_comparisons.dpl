@@ -1,0 +1,11 @@
+a = 5
+b = 10
+
+eq = a == b
+neq = a != b
+lt = a < b
+gt = a > b
+lte = a <= b
+gte = a >= b
+
+lt
