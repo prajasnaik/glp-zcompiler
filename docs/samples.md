@@ -31,4 +31,6 @@ The `samples/` folder is a feature regression pack for the language.
 ## Functions
 
 - `15_function_add.dpl` — typed function definition plus a direct call.
-- `16_recursive_function_fib.dpl` — recursive function evaluation using implicit final-expression return.
+- `16_recursive_function_fib.dpl` — recursive function evaluation using explicit `return`.
+- `17_function_loop_prime_sum.dpl` — function-local difference-equation loop using prime updates.
+- `18_function_loop_prime_fib.dpl` — iterative Fibonacci recurrence inside a function using prime updates.

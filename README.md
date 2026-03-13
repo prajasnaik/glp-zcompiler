@@ -68,11 +68,11 @@ gcc outputs/function_add.s -o outputs/function_add -lm
 
 ## Function syntax
 
-Functions are top-level declarations using explicit parameter and return types:
+Functions are top-level declarations using explicit parameter types, with optional return type:
 
 ```text
 fn add(a: int, b: int) -> int {
-	a + b
+	return a + b
 }
 ```
 
@@ -80,12 +80,38 @@ Current function rules:
 
 - functions are declared with `fn`
 - parameters require explicit types
-- return types are required via `->`
-- the final value-producing statement/expression is the return value
+- `return` statements are explicit; implicit return is not supported
+- `-> type` is optional:
+	- if present, function returns that type and must use explicit `return <expr>`
+	- if omitted, the function is `void` and any `return` is a compile error
 - functions may call functions defined later in the file
 - recursion and mutual recursion are supported
 - functions can access only their parameters and locals in this first version
 - top-level statements still form the executable `main` program
+
+## Sample regression runner
+
+The repository includes `test.py`, a Python-based end-to-end regression runner for all `.dpl` files in `samples/`.
+
+### Setup
+
+You need these tools available on your `PATH`:
+
+- `python3`
+- `zig`
+- `gcc`
+
+`test.py` builds the compiler, compiles each sample to assembly, links it, runs it, and checks the printed result against the expected output table embedded in the script.
+
+### Run it
+
+```sh
+python3 test.py
+```
+
+On success, it prints one `PASS` line per sample followed by a summary.
+
+If you add a new file under `samples/`, also add its expected printed output to the `EXPECTED_OUTPUTS` map in `test.py`.
 
 ## Zig references used for this repository
 

@@ -30,15 +30,36 @@ The output directory must already exist.
 Current repository testing is mainly sample-driven and manual runtime validation.
 
 - `zig build test` executes Zig test blocks defined in module/executable roots.
-- Sample regression is done by compiling and running selected `samples/*.dpl`.
+- `python3 test.py` runs the sample regression suite across every file in `samples/`.
+
+### `test.py` setup
+
+Before running `test.py`, make sure these tools are installed and available on `PATH`:
+
+- `python3`
+- `zig`
+- `gcc`
+
+The script will:
+
+1. build the compiler with `zig build`
+2. compile each `samples/*.dpl` file to assembly
+3. link the generated assembly with `gcc -lm`
+4. run the resulting executable
+5. assert the printed output matches the expected result for that sample
+
+Run it with:
+
+- `python3 test.py`
+
+If you add or rename a sample, update the `EXPECTED_OUTPUTS` map in `test.py` so the regression suite stays authoritative.
 
 ## Suggested validation checklist
 
 1. `zig build`
-2. Compile sample integer arithmetic (`samples/01_int_arithmetic.dpl`)
-3. Compile sample float arithmetic (`samples/02_float_arithmetic.dpl`)
-4. Compile conditional sample (`samples/06_if_else.dpl`)
-5. Compile loop/fibonacci (`samples/09_fibonacci.dpl`)
+2. `zig build test`
+3. `python3 test.py`
+4. If working on a specific feature, run its representative sample directly for faster iteration
 
 ## Build system notes
 

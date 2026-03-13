@@ -67,19 +67,31 @@ while (condition) statement_or_block
 
 ### Functions
 
+Typed-return function:
+
 ```text
 fn identifier(param_name: type, ...) -> return_type {
-	statements
-	final_expression_or_value_statement
+    statements
+    return expression
+}
+```
+
+Void function (no return type):
+
+```text
+fn identifier(param_name: type, ...) {
+    statements
 }
 ```
 
 Rules in the current implementation:
 
 - functions must be declared at top level
-- parameter types are mandatory
-- return types are mandatory
-- the last value-producing statement/expression is the return value
+- parameter types are mandatory and static
+- `return` is explicit only (`return expression`)
+- no implicit return from final expressions
+- if return type is declared via `->`, at least one explicit `return` is required
+- if return type is omitted, function is `void` and any `return` statement is a compile error
 - function calls use positional arguments only
 - functions may call functions declared later in the file
 - recursion and mutual recursion are supported
@@ -102,10 +114,13 @@ Function calls bind at atom level, so they behave like primary expressions insid
 
 ## Types and runtime value behavior
 
-- Numeric literals are parsed as int or float.
-- Mixed arithmetic promotes to float in backend expression generation.
+- Numeric literals are parsed as `int` or `float`.
+- Mixed arithmetic promotes to `float` in backend expression generation.
 - Comparisons/logical operations produce integer truth values (`0` or `1`) in codegen.
-- Function parameter and return types are explicit and currently support the scalar runtime types already handled by the backend (`int`, `float`, `boolean`).
+- Function parameter types are explicit and static.
+- Function return types are static when declared.
+- Omitting `-> type` creates a `void` function.
+- Supported scalar types are `int`, `float`, and `boolean`.
 
 ## Errors currently surfaced
 
@@ -124,6 +139,8 @@ Representative parser errors include:
 - `ArgumentCountMismatch`
 - `ArgumentTypeMismatch`
 - `ReturnTypeMismatch`
-- `FunctionMustEndWithValue`
+- `ExpectedExplicitReturn`
+- `VoidFunctionCannotReturnValue`
+- `VoidValueInExpression`
 
 Errors are printed with line/column context through token spans.
