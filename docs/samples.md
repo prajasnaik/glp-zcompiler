@@ -27,3 +27,8 @@ The `samples/` folder is a feature regression pack for the language.
 - `11_nested_while.dpl` — nested loop behavior and scope interactions.
 - `12_geometric_series.dpl` — iterative growth recurrence.
 - `13_float_while.dpl` — float arithmetic in loop body.
+
+## Functions
+
+- `15_function_add.dpl` — typed function definition plus a direct call.
+- `16_recursive_function_fib.dpl` — recursive function evaluation using implicit final-expression return.

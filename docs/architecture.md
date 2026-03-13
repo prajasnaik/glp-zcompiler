@@ -38,12 +38,15 @@
 - Implements:
   - literal parsing (`int`, `float`, `boolean`),
   - variable references,
+  - typed top-level function declarations,
+  - typed function calls,
   - unary `!`,
   - precedence-based binary expression parsing,
   - assignment and prime-assignment statements,
   - `if/else`, `while`, and block parsing,
   - top-level program parse into root block.
 - Maintains scoped symbol table with `StringHashMap` for variable definitions.
+- Performs a header-collection pass for function signatures so forward calls and recursion work.
 - Infers value kinds (int/float/boolean-ish) to guide code generation.
 - Collects `prime_vars` per while body to support simultaneous updates.
 - Uses arena allocation for AST lifetime management (`ParsedAst`).
@@ -53,11 +56,33 @@
 - Emits Intel-syntax x86-64 assembly for Linux SysV ABI.
 - Maintains stack slots for variables (`VarInfo`).
 - Tracks register kind (`rax` for ints, `xmm0` for floats).
+- Emits separate labels for top-level `fn` declarations and the program `main` body.
+- Lowers typed function calls using SysV integer and XMM argument registers.
 - Handles mixed int/float arithmetic with conversion paths.
 - Handles `if`/`else` and `while` label generation.
 - Implements prime assignment behavior by staging values in separate loop slots.
-- Chooses `%ld` or `%f` printf format for final result.
+- Chooses `%ld` or `%f` printf format for the final top-level result after codegen.
 - Uses `pow@PLT` for exponentiation.
+
+## Function compilation flow
+
+Function support adds two important stages to the existing pipeline:
+
+1. A pre-parse signature scan records every top-level function header.
+2. The main parser validates bodies and calls against those recorded signatures.
+
+This allows:
+
+- calls before definitions,
+- recursion,
+- mutual recursion.
+
+At codegen time:
+
+- each `fn` becomes a standalone text label with its own stack frame,
+- parameters are copied from ABI argument registers into local stack slots,
+- the function body leaves its final value in `rax` or `xmm0`,
+- top-level non-function statements remain the executable program body emitted as `main`.
 
 ## Runtime assumptions and ABI notes
 

@@ -65,6 +65,26 @@ if (condition) statement_or_block else statement_or_block
 while (condition) statement_or_block
 ```
 
+### Functions
+
+```text
+fn identifier(param_name: type, ...) -> return_type {
+	statements
+	final_expression_or_value_statement
+}
+```
+
+Rules in the current implementation:
+
+- functions must be declared at top level
+- parameter types are mandatory
+- return types are mandatory
+- the last value-producing statement/expression is the return value
+- function calls use positional arguments only
+- functions may call functions declared later in the file
+- recursion and mutual recursion are supported
+- function bodies may access only parameters and locals, not top-level variables
+
 ## Expressions and precedence
 
 Binding strengths (low to high):
@@ -78,11 +98,14 @@ Binding strengths (low to high):
 
 Unary `!` is parsed at atom level.
 
+Function calls bind at atom level, so they behave like primary expressions inside larger arithmetic or logical expressions.
+
 ## Types and runtime value behavior
 
 - Numeric literals are parsed as int or float.
 - Mixed arithmetic promotes to float in backend expression generation.
 - Comparisons/logical operations produce integer truth values (`0` or `1`) in codegen.
+- Function parameter and return types are explicit and currently support the scalar runtime types already handled by the backend (`int`, `float`, `boolean`).
 
 ## Errors currently surfaced
 
@@ -97,5 +120,10 @@ Representative parser errors include:
 - `PrimeOutsideLoop`
 - `ExpectedEqualAfterPrime`
 - `ExpectedClosingBrace`
+- `FunctionMustBeTopLevel`
+- `ArgumentCountMismatch`
+- `ArgumentTypeMismatch`
+- `ReturnTypeMismatch`
+- `FunctionMustEndWithValue`
 
 Errors are printed with line/column context through token spans.

@@ -28,7 +28,7 @@ Full documentation now lives in [`docs/`](./docs/README.md):
 - [x] `while` loops
 - [x] Prime assignment semantics inside loops (`` ` ``)
 - [x] Input/output file-path CLI
-- [ ] Functions
+- [x] Functions (`fn name(args) -> type { ... }`)
 
 ## Platform and toolchain
 
@@ -57,6 +57,35 @@ Assemble and run:
 gcc outputs/fibonacci.s -o outputs/fibonacci -lm
 ./outputs/fibonacci
 ```
+
+Compile a function sample:
+
+```sh
+./zig-out/bin/glp_zcompiler samples/15_function_add.dpl -o outputs/function_add.s
+gcc outputs/function_add.s -o outputs/function_add -lm
+./outputs/function_add
+```
+
+## Function syntax
+
+Functions are top-level declarations using explicit parameter and return types:
+
+```text
+fn add(a: int, b: int) -> int {
+	a + b
+}
+```
+
+Current function rules:
+
+- functions are declared with `fn`
+- parameters require explicit types
+- return types are required via `->`
+- the final value-producing statement/expression is the return value
+- functions may call functions defined later in the file
+- recursion and mutual recursion are supported
+- functions can access only their parameters and locals in this first version
+- top-level statements still form the executable `main` program
 
 ## Zig references used for this repository
 
