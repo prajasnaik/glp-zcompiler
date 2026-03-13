@@ -1,5 +1,5 @@
 fn add(a: int, b: int) -> int {
-    a + b
+    return a + b
 }
 
 add(20, 22)
