@@ -1,14 +1,18 @@
+//! Parser and AST definitions for `.dpl`.
+//! Includes scoped symbol tracking and arena-backed parse output.
 const std = @import("std");
 const lexer_module = @import("lexer.zig");
 const Lexer = lexer_module.Lexer;
 const Token = lexer_module.Token;
 const TokenType = lexer_module.TokenType;
 
+/// Byte-range span in source input.
 pub const Span = struct {
     start: usize,
     end: usize,
 };
 
+/// Literal payload variants in the AST.
 pub const LiteralValue = union(enum) {
     int: i64,
     float: f64,
@@ -17,6 +21,7 @@ pub const LiteralValue = union(enum) {
     null_val: void,
 };
 
+/// AST node kinds for expressions and statements.
 pub const NodeData = union(enum) { literal: LiteralValue, variable: []const u8, binary: struct {
     op: TokenType,
     left: *Node,
@@ -42,6 +47,7 @@ pub const NodeData = union(enum) { literal: LiteralValue, variable: []const u8, 
     value: *Node,
 } };
 
+/// A syntax tree node containing source span and node payload.
 pub const Node = struct {
     span: Span,
     data: NodeData,
@@ -56,6 +62,7 @@ pub const DataType = enum {
     string,
 };
 
+/// Nested lexical-scope symbol table with simple define/lookup operations.
 pub const SymbolTable = struct {
     scopes: std.ArrayList(std.StringHashMap(DataType)),
     allocator: std.mem.Allocator,
@@ -148,6 +155,7 @@ pub const Parser = struct {
     /// Set to the offending token whenever a parse error is returned.
     error_token: Token,
 
+    /// Construct a parser with two-token lookahead.
     pub fn init(input: []const u8, allocator: std.mem.Allocator) !Parser {
         var lexer = Lexer.init(input);
         const first = lexer.next();
@@ -163,6 +171,7 @@ pub const Parser = struct {
         };
     }
 
+    /// Release parser-owned resources (symbol scopes).
     pub fn deinit(self: *Parser) void {
         self.symbols.deinit();
     }
@@ -473,6 +482,7 @@ pub const Parser = struct {
         return node;
     }
 
+    /// Parse the entire input as a top-level block node.
     pub fn parseProgram(self: *Parser) !*Node {
         var stmts: std.ArrayList(*Node) = .empty;
 
@@ -502,11 +512,13 @@ pub const ParsedAst = struct {
 
     // The user of this library only needs to call this once
     // to free the entire syntax tree.
+    /// Free all memory allocated for this parsed AST.
     pub fn deinit(self: *ParsedAst) void {
         self.arena.deinit();
     }
 };
 
+/// Parse source text into an arena-backed AST wrapper.
 pub fn programParse(input: []const u8, backing_allocator: std.mem.Allocator) !ParsedAst {
     // 1. Create an Arena Allocator wrapping the standard allocator.
     var arena = std.heap.ArenaAllocator.init(backing_allocator);

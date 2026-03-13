@@ -1,64 +1,64 @@
 # GLP-ZCompiler
 
-This is a repo for a new programming language with difference equations as the thinking paradigm. All variable assignments, loops, etc. need to be with this in mind. The current progress is that we have a valid compiler for arithmetic.
+GLP-ZCompiler is a toy compiler for a recurrence-oriented language (`.dpl`) that emits x86-64 Linux assembly.
 
-## Next Steps (TODOs)
+The pipeline is:
 
-- [x] float-native operation support. So the output is not converted to int before printing.
-- [x] support for file paths rather than just file names
-- [x] handling assignments using symbol table
-- [x] building conditionals
-- [x] building while loop
-- [x] adding ' operator for difference equation logic
-- [ ] function support
+1. Lexing
+2. Parsing to AST
+3. Assembly generation
+4. External assembly/link via GCC
 
-## Prerequisites
+## Documentation
 
+Full documentation now lives in [`docs/`](./docs/README.md):
 
-**Supported Platform:**
+- Architecture: [`docs/architecture.md`](./docs/architecture.md)
+- Current language behavior: [`docs/language.md`](./docs/language.md)
+- Sample-by-sample guide: [`docs/samples.md`](./docs/samples.md)
+- Zig 0.15.2 concept map used by this codebase: [`docs/zig-reference.md`](./docs/zig-reference.md)
+- Build and contributor workflow: [`docs/development.md`](./docs/development.md)
 
-- x86 Linux systems only
+## Current feature status
 
-**Required Software:**
+- [x] Integer and float arithmetic
+- [x] Operator precedence (including right-associative power)
+- [x] Symbol-table-backed assignments
+- [x] Conditionals (`if` / `else`)
+- [x] `while` loops
+- [x] Prime assignment semantics inside loops (`` ` ``)
+- [x] Input/output file-path CLI
+- [ ] Functions
 
-- Zig (version 15.2 or below)
-- GNU GCC (for linking and executable generation)
+## Platform and toolchain
 
-## Usage
+- Supported target: x86 Linux
+- Zig: 0.15.2-compatible toolchain
+- GNU GCC: required to assemble/link generated `.s`
 
-Clone the repository:
+## Quick start
 
-```sh
-git clone https://github.com/prajasnaik/glp-zcompiler.git
-cd glp-zcompiler
-```
-
-Build the compiler:
+Build compiler:
 
 ```sh
 zig build
 ```
 
-Run the compiler with an input source file and an output path:
+Compile a sample to assembly:
 
 ```sh
-./zig-out/bin/glp_zcompiler <input.dpl> -o <path/to/output.s>
-```
-
-The output directory must already exist. For example, using the provided samples:
-
-```sh
+mkdir -p outputs
 ./zig-out/bin/glp_zcompiler samples/09_fibonacci.dpl -o outputs/fibonacci.s
 ```
 
-Compile the generated assembly into an executable:
+Assemble and run:
 
 ```sh
 gcc outputs/fibonacci.s -o outputs/fibonacci -lm
-```
-
-Run the executable:
-
-```sh
 ./outputs/fibonacci
 ```
+
+## Zig references used for this repository
+
+- Zig Language Reference 0.15.2: <https://ziglang.org/documentation/0.15.2/>
+- Zig Build System Guide: <https://ziglang.org/learn/build-system/>

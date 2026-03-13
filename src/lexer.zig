@@ -1,5 +1,8 @@
+//! Lexer for the `.dpl` language.
+//! Produces tokens with source spans used by the parser and diagnostics.
 const std = @import("std");
 
+/// Token categories recognized by the `.dpl` lexer.
 pub const TokenType = enum {
     // Literals & Identifiers
     number,
@@ -44,21 +47,25 @@ pub const TokenType = enum {
     kw_while,
 };
 
+/// A lexical token with byte-range span into the original source.
 pub const Token = struct {
     token_type: TokenType,
     lexeme: []const u8,
-    start: usize, // <-- Added for Span
-    end: usize, // <-- Added for Span
+    start: usize,
+    end: usize,
 };
 
+/// Stateful scanner over a source buffer.
 pub const Lexer = struct {
     input: []const u8,
     pos: usize,
 
+    /// Create a lexer for an input source buffer.
     pub fn init(input: []const u8) Lexer {
         return .{ .input = input, .pos = 0 };
     }
 
+    /// Return the next token and advance lexer state.
     pub fn next(self: *Lexer) Token {
         while (self.pos < self.input.len and (self.input[self.pos] == ' ' or self.input[self.pos] == '\t')) {
             self.pos += 1;
