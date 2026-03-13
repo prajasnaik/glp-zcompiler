@@ -1,3 +1,5 @@
+//! AST-to-assembly backend for GLP-ZCompiler.
+//! Emits Intel-syntax x86-64 Linux assembly and handles int/float code paths.
 const std = @import("std");
 const parser = @import("parser.zig");
 const Node = parser.Node;
@@ -25,6 +27,7 @@ pub const AsmGenerator = struct {
     /// footer can choose the correct printf format string.
     result_is_float: bool,
 
+    /// Create a backend instance bound to an output writer.
     pub fn init(writer: *std.Io.Writer, allocator: std.mem.Allocator) !AsmGenerator {
         return .{
             .writer = writer,
@@ -37,11 +40,13 @@ pub const AsmGenerator = struct {
         };
     }
 
+    /// Release backend-side maps and temporary state.
     pub fn deinit(self: *AsmGenerator) void {
         self.variables.deinit();
         self.prime_slots.deinit();
     }
 
+    /// Generate a complete assembly program from AST root.
     pub fn generate(self: *AsmGenerator, root: *Node) !void {
         std.debug.print("[asm] generate: starting with root type={s}\n", .{@tagName(root.data)});
         // First pass: figure out whether the last expression produces a float.
