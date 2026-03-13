@@ -49,6 +49,7 @@ pub const TokenType = enum {
     kw_or,
     kw_while,
     kw_fn,
+    kw_return,
 };
 
 /// A lexical token with byte-range span into the original source.
@@ -190,6 +191,7 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, lexeme, "or")) return self.makeToken(.kw_or, start);
             if (std.mem.eql(u8, lexeme, "while")) return self.makeToken(.kw_while, start);
             if (std.mem.eql(u8, lexeme, "fn")) return self.makeToken(.kw_fn, start);
+            if (std.mem.eql(u8, lexeme, "return")) return self.makeToken(.kw_return, start);
             return self.makeToken(.identifier, start);
         }
 

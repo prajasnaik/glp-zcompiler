@@ -68,6 +68,8 @@ pub const NodeData = union(enum) { literal: LiteralValue, variable: struct {
     args: []const *Node,
     param_types: []const DataType,
     return_type: DataType,
+}, return_statement: struct {
+    value: *Node,
 } };
 
 /// A syntax tree node containing source span and node payload.
@@ -81,6 +83,7 @@ pub const Node = struct {
 pub const DataType = enum {
     int,
     float,
+    void,
     boolean,
     string,
 };
@@ -162,9 +165,14 @@ fn isRightAssociative(op: TokenType) bool {
 fn parseTypeName(name: []const u8) !DataType {
     if (std.mem.eql(u8, name, "int")) return .int;
     if (std.mem.eql(u8, name, "float")) return .float;
+    if (std.mem.eql(u8, name, "void")) return .void;
     if (std.mem.eql(u8, name, "boolean")) return .boolean;
     if (std.mem.eql(u8, name, "string")) return .string;
     return error.ExpectedTypeName;
+}
+
+fn isTypeAssignable(expected: DataType, actual: DataType) bool {
+    return expected == actual;
 }
 
 fn deinitFunctionTable(functions: *std.StringHashMap(FunctionSignature)) void {
@@ -201,26 +209,29 @@ fn collectFunctionSignatures(input: []const u8, allocator: std.mem.Allocator) !s
                 token = lexer.next();
                 if (token.token_type != .identifier) return error.ExpectedTypeName;
                 const param_type = try parseTypeName(token.lexeme);
+                if (param_type == .void) return error.InvalidParameterType;
+
+                token = lexer.next();
 
                 for (params.items) |existing| {
                     if (std.mem.eql(u8, existing.name, param_name)) return error.ParameterAlreadyDefined;
                 }
                 try params.append(allocator, .{ .name = param_name, .ty = param_type });
 
-                token = lexer.next();
                 if (token.token_type == .comma) continue;
                 if (token.token_type == .r_paren) break;
                 return error.ExpectedCommaOrClosingParen;
             }
 
             token = lexer.next();
-            if (token.token_type != .arrow) return error.ExpectedArrowAfterParameters;
+            var return_type: DataType = .void;
+            if (token.token_type == .arrow) {
+                token = lexer.next();
+                if (token.token_type != .identifier) return error.ExpectedTypeName;
+                return_type = try parseTypeName(token.lexeme);
+                token = lexer.next();
+            }
 
-            token = lexer.next();
-            if (token.token_type != .identifier) return error.ExpectedTypeName;
-            const return_type = try parseTypeName(token.lexeme);
-
-            token = lexer.next();
             if (token.token_type != .l_brace) return error.ExpectedFunctionBody;
 
             try functions.put(name_token.lexeme, .{
@@ -281,6 +292,44 @@ fn collectPrimeVars(node: *Node, list: *std.ArrayList([]const u8), allocator: st
     }
 }
 
+fn collectReturnTypes(parser: *const Parser, node: *const Node, list: *std.ArrayList(DataType), allocator: std.mem.Allocator) !void {
+    switch (node.data) {
+        .return_statement => |ret| {
+            try list.append(allocator, parser.inferType(ret.value));
+        },
+        .block => |block| {
+            for (block.statements) |stmt| {
+                try collectReturnTypes(parser, stmt, list, allocator);
+            }
+        },
+        .if_statement => |stmt| {
+            try collectReturnTypes(parser, stmt.then_branch, list, allocator);
+            if (stmt.else_branch) |else_branch| {
+                try collectReturnTypes(parser, else_branch, list, allocator);
+            }
+        },
+        .while_loop => |loop_stmt| {
+            try collectReturnTypes(parser, loop_stmt.body, list, allocator);
+        },
+        else => {},
+    }
+}
+
+fn hasExplicitReturn(node: *const Node) bool {
+    return switch (node.data) {
+        .return_statement => true,
+        .block => |block| blk: {
+            for (block.statements) |stmt| {
+                if (hasExplicitReturn(stmt)) break :blk true;
+            }
+            break :blk false;
+        },
+        .if_statement => |stmt| hasExplicitReturn(stmt.then_branch) or (if (stmt.else_branch) |else_branch| hasExplicitReturn(else_branch) else false),
+        .while_loop => |loop_stmt| hasExplicitReturn(loop_stmt.body),
+        else => false,
+    };
+}
+
 pub const Parser = struct {
     lexer: Lexer,
     allocator: std.mem.Allocator,
@@ -334,10 +383,6 @@ pub const Parser = struct {
         return self.symbols.lookupTypeFrom(name, self.visibleScopeStart());
     }
 
-    fn isTypeAssignable(expected: DataType, actual: DataType) bool {
-        return expected == actual or (expected == .float and actual == .int);
-    }
-
     fn valueType(self: *const Parser, node: *const Node) ?DataType {
         return switch (node.data) {
             .literal, .variable, .binary, .unary, .function_call => self.inferType(node),
@@ -384,10 +429,11 @@ pub const Parser = struct {
             .assignment => |a| self.inferType(a.value),
             .prime_assignment => |pa| self.inferType(pa.value),
             .function_call => |call| call.return_type,
-            .block => .int,
+            .return_statement => |ret| self.inferType(ret.value),
+            .block => .void,
             .if_statement => .int,
             .while_loop => .int,
-            .function_def => .int,
+            .function_def => .void,
         };
     }
 
@@ -543,6 +589,11 @@ pub const Parser = struct {
             const nextMinPower = if (isRightAssociative(op_type)) power else power + 1;
             const right = try self.parseExpression(nextMinPower);
 
+            if (self.inferType(left) == .void or self.inferType(right) == .void) {
+                self.error_token = self.current;
+                return error.VoidValueInExpression;
+            }
+
             const node = try self.allocator.create(Node);
             node.* = .{
                 .span = .{ .start = left.span.start, .end = right.span.end }, // Dynamic span calculation!
@@ -566,6 +617,29 @@ pub const Parser = struct {
             return try self.parseFunction();
         }
 
+        if (self.current.token_type == .kw_return) {
+            if (self.function_scope_min == null) {
+                self.error_token = self.current;
+                return error.ReturnOutsideFunction;
+            }
+            if (self.current_function_return_type == null or self.current_function_return_type.? == .void) {
+                self.error_token = self.current;
+                return error.VoidFunctionCannotReturnValue;
+            }
+            const return_token = self.current;
+            self.advance(); // consume 'return'
+
+            const value = try self.parseExpression(0);
+            const node = try self.allocator.create(Node);
+            node.* = .{
+                .span = .{ .start = return_token.start, .end = value.span.end },
+                .data = .{ .return_statement = .{ .value = value } },
+            };
+
+            if (self.current.token_type == .newline) self.advance();
+            return node;
+        }
+
         if (self.current.token_type == .l_brace) return try self.parseBlock();
 
         if (self.current.token_type == .identifier and self.peek_token.token_type == .equal) {
@@ -575,6 +649,10 @@ pub const Parser = struct {
 
             const value = try self.parseExpression(0);
             const val_type = self.inferType(value);
+            if (val_type == .void) {
+                self.error_token = target_token;
+                return error.VoidValueInExpression;
+            }
             try self.symbols.define(target_token.lexeme, val_type);
 
             const node = try self.allocator.create(Node);
@@ -768,6 +846,12 @@ pub const Parser = struct {
                 return error.ExpectedTypeName;
             }
             const param_type = try parseTypeName(self.current.lexeme);
+            if (param_type == .void) {
+                self.error_token = self.current;
+                return error.InvalidParameterType;
+            }
+            self.advance();
+
             for (params.items) |existing| {
                 if (std.mem.eql(u8, existing.name, param_name)) {
                     self.error_token = self.current;
@@ -775,7 +859,6 @@ pub const Parser = struct {
                 }
             }
             try params.append(self.allocator, .{ .name = param_name, .ty = param_type });
-            self.advance();
 
             if (self.current.token_type == .comma) {
                 self.advance();
@@ -788,18 +871,17 @@ pub const Parser = struct {
         }
         self.advance(); // consume ')'
 
-        if (self.current.token_type != .arrow) {
-            self.error_token = self.current;
-            return error.ExpectedArrowAfterParameters;
-        }
-        self.advance();
+        var parsed_return_type: DataType = .void;
+        if (self.current.token_type == .arrow) {
+            self.advance();
 
-        if (self.current.token_type != .identifier) {
-            self.error_token = self.current;
-            return error.ExpectedTypeName;
+            if (self.current.token_type != .identifier) {
+                self.error_token = self.current;
+                return error.ExpectedTypeName;
+            }
+            parsed_return_type = try parseTypeName(self.current.lexeme);
+            self.advance();
         }
-        const return_type = try parseTypeName(self.current.lexeme);
-        self.advance();
 
         if (self.current.token_type != .l_brace) {
             self.error_token = self.current;
@@ -810,9 +892,19 @@ pub const Parser = struct {
             self.error_token = name_token;
             return error.UndefinedFunction;
         };
-        if (signature.params.len != params.items.len or signature.return_type != return_type) {
+        if (signature.params.len != params.items.len) {
             self.error_token = name_token;
             return error.FunctionSignatureMismatch;
+        }
+        if (parsed_return_type != signature.return_type) {
+            self.error_token = name_token;
+            return error.FunctionSignatureMismatch;
+        }
+        for (params.items, 0..) |param, i| {
+            if (param.ty != signature.params[i].ty) {
+                self.error_token = name_token;
+                return error.FunctionSignatureMismatch;
+            }
         }
 
         try self.symbols.pushScope();
@@ -821,7 +913,7 @@ pub const Parser = struct {
         const previous_scope_min = self.function_scope_min;
         const previous_return_type = self.current_function_return_type;
         self.function_scope_min = self.symbols.scopes.items.len - 1;
-        self.current_function_return_type = return_type;
+        self.current_function_return_type = parsed_return_type;
         defer {
             self.function_scope_min = previous_scope_min;
             self.current_function_return_type = previous_return_type;
@@ -834,13 +926,24 @@ pub const Parser = struct {
         const body = try self.parseBlockWithScope(false);
         self.symbols.popScope();
 
-        const body_type = self.valueType(body) orelse {
-            self.error_token = name_token;
-            return error.FunctionMustEndWithValue;
-        };
-        if (!isTypeAssignable(return_type, body_type)) {
-            self.error_token = name_token;
-            return error.ReturnTypeMismatch;
+        var return_types: std.ArrayList(DataType) = .empty;
+        try collectReturnTypes(self, body, &return_types, self.allocator);
+        if (parsed_return_type == .void) {
+            if (return_types.items.len > 0 or hasExplicitReturn(body)) {
+                self.error_token = name_token;
+                return error.VoidFunctionCannotReturnValue;
+            }
+        } else {
+            if (return_types.items.len == 0) {
+                self.error_token = name_token;
+                return error.ExpectedExplicitReturn;
+            }
+            for (return_types.items) |ret_ty| {
+                if (!isTypeAssignable(parsed_return_type, ret_ty)) {
+                    self.error_token = name_token;
+                    return error.ReturnTypeMismatch;
+                }
+            }
         }
 
         const node = try self.allocator.create(Node);
@@ -849,7 +952,7 @@ pub const Parser = struct {
             .data = .{ .function_def = .{
                 .name = name_token.lexeme,
                 .params = try params.toOwnedSlice(self.allocator),
-                .return_type = return_type,
+                .return_type = parsed_return_type,
                 .body = body,
             } },
         };
@@ -942,7 +1045,7 @@ test "parses typed function definition and call" {
     const testing = std.testing;
     const source =
         \\fn add(a: int, b: int) -> int {
-        \\    a + b
+        \\    return a + b
         \\}
         \\add(2, 3)
     ;
@@ -965,10 +1068,10 @@ test "supports forward calls and mutual recursion" {
     const source =
         \\is_even(4)
         \\fn is_even(n: int) -> boolean {
-        \\    if (n == 0) { true } else { is_odd(n - 1) }
+        \\    if (n == 0) { return true } else { return is_odd(n - 1) }
         \\}
         \\fn is_odd(n: int) -> boolean {
-        \\    if (n == 0) { false } else { is_even(n - 1) }
+        \\    if (n == 0) { return false } else { return is_even(n - 1) }
         \\}
     ;
 
@@ -996,10 +1099,86 @@ test "rejects function calls with wrong argument type" {
     const testing = std.testing;
     const source =
         \\fn halve(x: float) -> float {
-        \\    x / 2.0
+        \\    return x / 2.0
         \\}
         \\halve(true)
     ;
 
     try testing.expectError(error.ArgumentTypeMismatch, programParse(source, testing.allocator));
+}
+
+test "requires explicit return for non-void function" {
+    const testing = std.testing;
+    const source =
+        \\fn add(a: int, b: int) -> int {
+        \\    a + b
+        \\}
+        \\add(1, 2)
+    ;
+
+    try testing.expectError(error.ExpectedExplicitReturn, programParse(source, testing.allocator));
+}
+
+test "void function allowed when no return type and no return statement" {
+    const testing = std.testing;
+    const source =
+        \\fn spin(n: int) {
+        \\    i = 0
+        \\    while (i < n) {
+        \\        i` = i + 1
+        \\    }
+        \\}
+        \\spin(5)
+        \\42
+    ;
+
+    var ast = try programParse(source, testing.allocator);
+    defer ast.deinit();
+    try testing.expect(ast.root.data == .block);
+}
+
+test "void function cannot return value" {
+    const testing = std.testing;
+    const source =
+        \\fn bad() {
+        \\    return 1
+        \\}
+        \\0
+    ;
+
+    try testing.expectError(error.VoidFunctionCannotReturnValue, programParse(source, testing.allocator));
+}
+
+test "rejects missing parameter type annotation" {
+    const testing = std.testing;
+    const source =
+        \\fn bad_param(x) -> int {
+        \\    return x
+        \\}
+        \\bad_param(1)
+    ;
+
+    try testing.expectError(error.ExpectedColonAfterParameter, programParse(source, testing.allocator));
+}
+
+test "function with loop and prime assignments parses" {
+    const testing = std.testing;
+    const source =
+        \\fn fib_loop(n: int) -> int {
+        \\    a = 0
+        \\    b = 1
+        \\    i = 0
+        \\    while (i < n) {
+        \\        a` = b
+        \\        b` = a + b
+        \\        i` = i + 1
+        \\    }
+        \\    return a
+        \\}
+        \\fib_loop(10)
+    ;
+
+    var ast = try programParse(source, testing.allocator);
+    defer ast.deinit();
+    try testing.expect(ast.root.data == .block);
 }

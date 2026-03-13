@@ -33,6 +33,8 @@ pub const AsmGenerator = struct {
     stack_offset: i32,
     label_counter: u32,
     last_result_kind: RegKind,
+    current_return_label: ?u32,
+    current_function_return_type: ?DataType,
 
     /// Create a backend instance bound to an output writer.
     pub fn init(writer: *std.Io.Writer, allocator: std.mem.Allocator) !AsmGenerator {
@@ -45,6 +47,8 @@ pub const AsmGenerator = struct {
             .stack_offset = 0,
             .label_counter = 0,
             .last_result_kind = .int,
+            .current_return_label = null,
+            .current_function_return_type = null,
         };
     }
 
@@ -155,6 +159,8 @@ pub const AsmGenerator = struct {
         self.scope_stack.clearRetainingCapacity();
         self.stack_offset = 0;
         self.last_result_kind = .int;
+        self.current_return_label = null;
+        self.current_function_return_type = null;
     }
 
     fn beginScope(self: *AsmGenerator) anyerror!void {
@@ -261,16 +267,24 @@ pub const AsmGenerator = struct {
             \\
         , .{ function.name, function.name, frame_size });
 
-        try self.bindParameters(function.params);
-        const result_kind = try self.generateFunctionBody(function.body);
-        _ = try self.convertResultToType(result_kind, function.return_type);
+        const return_label_id = self.label_counter;
+        self.label_counter += 1;
+        self.current_return_label = return_label_id;
+        self.current_function_return_type = function.return_type;
 
+        try self.bindParameters(function.params);
+        _ = try self.generateFunctionBody(function.body);
+
+        try self.writer.print(".Lfn_return_{d}:\n", .{return_label_id});
         try self.endScope();
         try self.writer.print(
             \\    leave
             \\    ret
             \\
         , .{});
+
+        self.current_return_label = null;
+        self.current_function_return_type = null;
     }
 
     fn bindParameters(self: *AsmGenerator, params: []const FunctionParam) anyerror!void {
@@ -425,6 +439,14 @@ pub const AsmGenerator = struct {
                     .float => try self.writer.print("    movsd [rbp - {d}], xmm0\n", .{slot.offset}),
                 }
                 return kind;
+            },
+            .return_statement => |ret_stmt| {
+                const ret_kind = try self.generateExpr(ret_stmt.value);
+                const expected = self.current_function_return_type orelse return error.ReturnOutsideFunction;
+                _ = try self.convertResultToType(ret_kind, expected);
+                const label_id = self.current_return_label orelse return error.ReturnOutsideFunction;
+                try self.writer.print("    jmp .Lfn_return_{d}\n", .{label_id});
+                return dataTypeToRegKind(expected);
             },
             .function_def => return .int,
         }
@@ -660,6 +682,10 @@ pub const AsmGenerator = struct {
         }
 
         try self.writer.print("    call {s}\n", .{name});
+        if (return_type == .void) {
+            try self.writer.print("    mov rax, 0\n", .{});
+            return .int;
+        }
         return dataTypeToRegKind(return_type);
     }
 };
