@@ -1,14 +1,18 @@
+//! Parser and AST definitions for `.dpl`.
+//! Includes scoped symbol tracking and arena-backed parse output.
 const std = @import("std");
 const lexer_module = @import("lexer.zig");
 const Lexer = lexer_module.Lexer;
 const Token = lexer_module.Token;
 const TokenType = lexer_module.TokenType;
 
+/// Byte-range span in source input.
 pub const Span = struct {
     start: usize,
     end: usize,
 };
 
+/// Literal payload variants in the AST.
 pub const LiteralValue = union(enum) {
     int: i64,
     float: f64,
@@ -17,7 +21,21 @@ pub const LiteralValue = union(enum) {
     null_val: void,
 };
 
-pub const NodeData = union(enum) { literal: LiteralValue, variable: []const u8, binary: struct {
+pub const FunctionParam = struct {
+    name: []const u8,
+    ty: DataType,
+};
+
+pub const FunctionSignature = struct {
+    params: []const FunctionParam,
+    return_type: DataType,
+};
+
+/// AST node kinds for expressions and statements.
+pub const NodeData = union(enum) { literal: LiteralValue, variable: struct {
+    name: []const u8,
+    ty: DataType,
+}, binary: struct {
     op: TokenType,
     left: *Node,
     right: *Node,
@@ -40,8 +58,21 @@ pub const NodeData = union(enum) { literal: LiteralValue, variable: []const u8, 
 }, prime_assignment: struct {
     target: []const u8,
     value: *Node,
+}, function_def: struct {
+    name: []const u8,
+    params: []const FunctionParam,
+    return_type: DataType,
+    body: *Node,
+}, function_call: struct {
+    name: []const u8,
+    args: []const *Node,
+    param_types: []const DataType,
+    return_type: DataType,
+}, return_statement: struct {
+    value: *Node,
 } };
 
+/// A syntax tree node containing source span and node payload.
 pub const Node = struct {
     span: Span,
     data: NodeData,
@@ -52,10 +83,12 @@ pub const Node = struct {
 pub const DataType = enum {
     int,
     float,
+    void,
     boolean,
     string,
 };
 
+/// Nested lexical-scope symbol table with simple define/lookup operations.
 pub const SymbolTable = struct {
     scopes: std.ArrayList(std.StringHashMap(DataType)),
     allocator: std.mem.Allocator,
@@ -89,12 +122,25 @@ pub const SymbolTable = struct {
     }
 
     pub fn isDefined(self: *const SymbolTable, name: []const u8) bool {
+        return self.isDefinedFrom(name, 0);
+    }
+
+    pub fn isDefinedFrom(self: *const SymbolTable, name: []const u8, min_scope: usize) bool {
         var i = self.scopes.items.len;
-        while (i > 0) {
+        while (i > min_scope) {
             i -= 1;
             if (self.scopes.items[i].get(name) != null) return true;
         }
         return false;
+    }
+
+    pub fn lookupTypeFrom(self: *const SymbolTable, name: []const u8, min_scope: usize) ?DataType {
+        var i = self.scopes.items.len;
+        while (i > min_scope) {
+            i -= 1;
+            if (self.scopes.items[i].get(name)) |ty| return ty;
+        }
+        return null;
     }
 };
 
@@ -114,6 +160,114 @@ fn getBindingPower(op: TokenType) usize {
 
 fn isRightAssociative(op: TokenType) bool {
     return op == .caret;
+}
+
+fn parseTypeName(name: []const u8) !DataType {
+    if (std.mem.eql(u8, name, "int")) return .int;
+    if (std.mem.eql(u8, name, "float")) return .float;
+    if (std.mem.eql(u8, name, "void")) return .void;
+    if (std.mem.eql(u8, name, "boolean")) return .boolean;
+    if (std.mem.eql(u8, name, "string")) return .string;
+    return error.ExpectedTypeName;
+}
+
+fn isTypeAssignable(expected: DataType, actual: DataType) bool {
+    return expected == actual;
+}
+
+fn deinitFunctionTable(functions: *std.StringHashMap(FunctionSignature)) void {
+    functions.deinit();
+}
+
+fn collectFunctionSignatures(input: []const u8, allocator: std.mem.Allocator) !std.StringHashMap(FunctionSignature) {
+    var functions = std.StringHashMap(FunctionSignature).init(allocator);
+    errdefer deinitFunctionTable(&functions);
+
+    var lexer = Lexer.init(input);
+    var current = lexer.next();
+    var brace_depth: usize = 0;
+
+    while (current.token_type != .eof) {
+        if (brace_depth == 0 and current.token_type == .kw_fn) {
+            const name_token = lexer.next();
+            if (name_token.token_type != .identifier) return error.ExpectedFunctionName;
+            if (functions.get(name_token.lexeme) != null) return error.FunctionAlreadyDefined;
+
+            var token = lexer.next();
+            if (token.token_type != .l_paren) return error.ExpectedParameterList;
+
+            var params: std.ArrayList(FunctionParam) = .empty;
+            while (true) {
+                token = lexer.next();
+                if (token.token_type == .r_paren) break;
+                if (token.token_type != .identifier) return error.ExpectedParameterName;
+                const param_name = token.lexeme;
+
+                token = lexer.next();
+                if (token.token_type != .colon) return error.ExpectedColonAfterParameter;
+
+                token = lexer.next();
+                if (token.token_type != .identifier) return error.ExpectedTypeName;
+                const param_type = try parseTypeName(token.lexeme);
+                if (param_type == .void) return error.InvalidParameterType;
+
+                token = lexer.next();
+
+                for (params.items) |existing| {
+                    if (std.mem.eql(u8, existing.name, param_name)) return error.ParameterAlreadyDefined;
+                }
+                try params.append(allocator, .{ .name = param_name, .ty = param_type });
+
+                if (token.token_type == .comma) continue;
+                if (token.token_type == .r_paren) break;
+                return error.ExpectedCommaOrClosingParen;
+            }
+
+            token = lexer.next();
+            var return_type: DataType = .void;
+            if (token.token_type == .arrow) {
+                token = lexer.next();
+                if (token.token_type != .identifier) return error.ExpectedTypeName;
+                return_type = try parseTypeName(token.lexeme);
+                token = lexer.next();
+            }
+
+            if (token.token_type != .l_brace) return error.ExpectedFunctionBody;
+
+            try functions.put(name_token.lexeme, .{
+                .params = try params.toOwnedSlice(allocator),
+                .return_type = return_type,
+            });
+
+            var function_brace_depth: usize = 1;
+            while (function_brace_depth > 0) {
+                token = lexer.next();
+                switch (token.token_type) {
+                    .l_brace => function_brace_depth += 1,
+                    .r_brace => {
+                        function_brace_depth -= 1;
+                    },
+                    .eof => return error.ExpectedClosingBrace,
+                    else => {},
+                }
+            }
+
+            current = lexer.next();
+            continue;
+        }
+
+        switch (current.token_type) {
+            .l_brace => brace_depth += 1,
+            .r_brace => {
+                if (brace_depth > 0) brace_depth -= 1;
+            },
+            else => {},
+        }
+
+        current = lexer.next();
+    }
+
+    return functions;
 }
 
 /// Walk `node` and collect every unique `prime_assignment` target name into `list`.
@@ -138,17 +292,60 @@ fn collectPrimeVars(node: *Node, list: *std.ArrayList([]const u8), allocator: st
     }
 }
 
+fn collectReturnTypes(parser: *const Parser, node: *const Node, list: *std.ArrayList(DataType), allocator: std.mem.Allocator) !void {
+    switch (node.data) {
+        .return_statement => |ret| {
+            try list.append(allocator, parser.inferType(ret.value));
+        },
+        .block => |block| {
+            for (block.statements) |stmt| {
+                try collectReturnTypes(parser, stmt, list, allocator);
+            }
+        },
+        .if_statement => |stmt| {
+            try collectReturnTypes(parser, stmt.then_branch, list, allocator);
+            if (stmt.else_branch) |else_branch| {
+                try collectReturnTypes(parser, else_branch, list, allocator);
+            }
+        },
+        .while_loop => |loop_stmt| {
+            try collectReturnTypes(parser, loop_stmt.body, list, allocator);
+        },
+        else => {},
+    }
+}
+
+fn hasExplicitReturn(node: *const Node) bool {
+    return switch (node.data) {
+        .return_statement => true,
+        .block => |block| blk: {
+            for (block.statements) |stmt| {
+                if (hasExplicitReturn(stmt)) break :blk true;
+            }
+            break :blk false;
+        },
+        .if_statement => |stmt| hasExplicitReturn(stmt.then_branch) or (if (stmt.else_branch) |else_branch| hasExplicitReturn(else_branch) else false),
+        .while_loop => |loop_stmt| hasExplicitReturn(loop_stmt.body),
+        else => false,
+    };
+}
+
 pub const Parser = struct {
     lexer: Lexer,
     allocator: std.mem.Allocator,
     symbols: SymbolTable,
+    functions: std.StringHashMap(FunctionSignature),
     current: Token,
     peek_token: Token,
     loop_depth: usize,
+    block_depth: usize,
+    function_scope_min: ?usize,
+    current_function_return_type: ?DataType,
     /// Set to the offending token whenever a parse error is returned.
     error_token: Token,
 
-    pub fn init(input: []const u8, allocator: std.mem.Allocator) !Parser {
+    /// Construct a parser with two-token lookahead.
+    pub fn init(input: []const u8, allocator: std.mem.Allocator, functions: std.StringHashMap(FunctionSignature)) !Parser {
         var lexer = Lexer.init(input);
         const first = lexer.next();
         const second = lexer.next();
@@ -156,20 +353,52 @@ pub const Parser = struct {
             .lexer = lexer,
             .allocator = allocator,
             .symbols = try SymbolTable.init(allocator),
+            .functions = functions,
             .current = first,
             .peek_token = second,
             .loop_depth = 0,
+            .block_depth = 0,
+            .function_scope_min = null,
+            .current_function_return_type = null,
             .error_token = .{ .token_type = .eof, .lexeme = "", .start = 0, .end = 0 },
         };
     }
 
+    /// Release parser-owned resources (symbol scopes).
     pub fn deinit(self: *Parser) void {
         self.symbols.deinit();
+        self.functions.deinit();
     }
 
     fn advance(self: *Parser) void {
         self.current = self.peek_token;
         self.peek_token = self.lexer.next();
+    }
+
+    fn visibleScopeStart(self: *const Parser) usize {
+        return self.function_scope_min orelse 0;
+    }
+
+    fn lookupVariableType(self: *const Parser, name: []const u8) ?DataType {
+        return self.symbols.lookupTypeFrom(name, self.visibleScopeStart());
+    }
+
+    fn valueType(self: *const Parser, node: *const Node) ?DataType {
+        return switch (node.data) {
+            .literal, .variable, .binary, .unary, .function_call => self.inferType(node),
+            .block => |block| blk: {
+                if (block.statements.len == 0) break :blk null;
+                break :blk self.valueType(block.statements[block.statements.len - 1]);
+            },
+            .if_statement => |stmt| blk: {
+                const then_ty = self.valueType(stmt.then_branch) orelse break :blk null;
+                const else_node = stmt.else_branch orelse break :blk null;
+                const else_ty = self.valueType(else_node) orelse break :blk null;
+                if (then_ty != else_ty) break :blk null;
+                break :blk then_ty;
+            },
+            else => null,
+        };
     }
 
     /// Infer the DataType of an expression node (best-effort; defaults to .int for unknowns).
@@ -182,13 +411,8 @@ pub const Parser = struct {
                 .string => .string,
                 .null_val => .int,
             },
-            .variable => |name| blk: {
-                var i = self.symbols.scopes.items.len;
-                while (i > 0) {
-                    i -= 1;
-                    if (self.symbols.scopes.items[i].get(name)) |t| break :blk t;
-                }
-                break :blk .int;
+            .variable => |var_ref| blk: {
+                break :blk var_ref.ty;
             },
             .binary => |b| blk: {
                 // Comparison/logical ops always produce boolean (stored as int 0/1)
@@ -204,10 +428,71 @@ pub const Parser = struct {
             .unary => .int, // bang produces 0/1
             .assignment => |a| self.inferType(a.value),
             .prime_assignment => |pa| self.inferType(pa.value),
-            .block => .int,
+            .function_call => |call| call.return_type,
+            .return_statement => |ret| self.inferType(ret.value),
+            .block => .void,
             .if_statement => .int,
             .while_loop => .int,
+            .function_def => .void,
         };
+    }
+
+    fn parseCall(self: *Parser, ident_token: Token) anyerror!*Node {
+        const signature = self.functions.get(ident_token.lexeme) orelse {
+            self.error_token = ident_token;
+            return error.UndefinedFunction;
+        };
+
+        self.advance(); // consume identifier
+        self.advance(); // consume '('
+
+        var args: std.ArrayList(*Node) = .empty;
+        var arg_index: usize = 0;
+        while (self.current.token_type != .r_paren) {
+            const arg = try self.parseExpression(0);
+            if (arg_index >= signature.params.len) {
+                self.error_token = ident_token;
+                return error.ArgumentCountMismatch;
+            }
+            const arg_ty = self.inferType(arg);
+            if (!isTypeAssignable(signature.params[arg_index].ty, arg_ty)) {
+                self.error_token = ident_token;
+                return error.ArgumentTypeMismatch;
+            }
+            try args.append(self.allocator, arg);
+            arg_index += 1;
+
+            if (self.current.token_type == .comma) {
+                self.advance();
+                continue;
+            }
+            if (self.current.token_type != .r_paren) {
+                self.error_token = self.current;
+                return error.ExpectedCommaOrClosingParen;
+            }
+        }
+
+        if (arg_index != signature.params.len) {
+            self.error_token = ident_token;
+            return error.ArgumentCountMismatch;
+        }
+
+        const node = try self.allocator.create(Node);
+        var param_types = try self.allocator.alloc(DataType, signature.params.len);
+        for (signature.params, 0..) |param, i| {
+            param_types[i] = param.ty;
+        }
+        node.* = .{
+            .span = .{ .start = ident_token.start, .end = self.current.end },
+            .data = .{ .function_call = .{
+                .name = ident_token.lexeme,
+                .args = try args.toOwnedSlice(self.allocator),
+                .param_types = param_types,
+                .return_type = signature.return_type,
+            } },
+        };
+        self.advance(); // consume ')'
+        return node;
     }
 
     fn parseAtom(self: *Parser) anyerror!*Node {
@@ -230,15 +515,19 @@ pub const Parser = struct {
         }
 
         if (token.token_type == .identifier) {
-            if (!self.symbols.isDefined(token.lexeme)) {
+            if (self.peek_token.token_type == .l_paren) {
+                return self.parseCall(token);
+            }
+
+            const var_type = self.lookupVariableType(token.lexeme) orelse {
                 self.error_token = token;
                 return error.UndefinedVariable;
-            }
+            };
 
             const node = try self.allocator.create(Node);
             node.* = .{
                 .span = .{ .start = token.start, .end = token.end },
-                .data = .{ .variable = token.lexeme },
+                .data = .{ .variable = .{ .name = token.lexeme, .ty = var_type } },
             };
             self.advance();
             return node;
@@ -300,6 +589,11 @@ pub const Parser = struct {
             const nextMinPower = if (isRightAssociative(op_type)) power else power + 1;
             const right = try self.parseExpression(nextMinPower);
 
+            if (self.inferType(left) == .void or self.inferType(right) == .void) {
+                self.error_token = self.current;
+                return error.VoidValueInExpression;
+            }
+
             const node = try self.allocator.create(Node);
             node.* = .{
                 .span = .{ .start = left.span.start, .end = right.span.end }, // Dynamic span calculation!
@@ -315,6 +609,37 @@ pub const Parser = struct {
         while (self.current.token_type == .newline) self.advance();
         if (self.current.token_type == .eof) return null;
 
+        if (self.current.token_type == .kw_fn) {
+            if (self.block_depth != 0 or self.function_scope_min != null) {
+                self.error_token = self.current;
+                return error.FunctionMustBeTopLevel;
+            }
+            return try self.parseFunction();
+        }
+
+        if (self.current.token_type == .kw_return) {
+            if (self.function_scope_min == null) {
+                self.error_token = self.current;
+                return error.ReturnOutsideFunction;
+            }
+            if (self.current_function_return_type == null or self.current_function_return_type.? == .void) {
+                self.error_token = self.current;
+                return error.VoidFunctionCannotReturnValue;
+            }
+            const return_token = self.current;
+            self.advance(); // consume 'return'
+
+            const value = try self.parseExpression(0);
+            const node = try self.allocator.create(Node);
+            node.* = .{
+                .span = .{ .start = return_token.start, .end = value.span.end },
+                .data = .{ .return_statement = .{ .value = value } },
+            };
+
+            if (self.current.token_type == .newline) self.advance();
+            return node;
+        }
+
         if (self.current.token_type == .l_brace) return try self.parseBlock();
 
         if (self.current.token_type == .identifier and self.peek_token.token_type == .equal) {
@@ -324,6 +649,10 @@ pub const Parser = struct {
 
             const value = try self.parseExpression(0);
             const val_type = self.inferType(value);
+            if (val_type == .void) {
+                self.error_token = target_token;
+                return error.VoidValueInExpression;
+            }
             try self.symbols.define(target_token.lexeme, val_type);
 
             const node = try self.allocator.create(Node);
@@ -345,7 +674,7 @@ pub const Parser = struct {
                 self.error_token = target_token;
                 return error.PrimeOutsideLoop;
             }
-            if (self.symbols.isDefined(target_token.lexeme) == false) {
+            if (self.lookupVariableType(target_token.lexeme) == null) {
                 self.error_token = target_token;
                 return error.UndefinedVariable;
             }
@@ -442,9 +771,17 @@ pub const Parser = struct {
     }
 
     fn parseBlock(self: *Parser) anyerror!*Node {
+        return self.parseBlockWithScope(true);
+    }
+
+    fn parseBlockWithScope(self: *Parser, create_scope: bool) anyerror!*Node {
         const start_pos = self.current.start;
         self.advance(); // consume '{'
-        try self.symbols.pushScope();
+        self.block_depth += 1;
+        defer self.block_depth -= 1;
+
+        if (create_scope) try self.symbols.pushScope();
+        defer if (create_scope) self.symbols.popScope();
 
         var stmts: std.ArrayList(*Node) = .empty;
 
@@ -463,7 +800,6 @@ pub const Parser = struct {
 
         const end_pos = self.current.end;
         self.advance(); // consume '}'
-        self.symbols.popScope();
 
         const node = try self.allocator.create(Node);
         node.* = .{
@@ -473,6 +809,157 @@ pub const Parser = struct {
         return node;
     }
 
+    fn parseFunction(self: *Parser) anyerror!*Node {
+        const fn_token = self.current;
+        self.advance(); // consume 'fn'
+
+        if (self.current.token_type != .identifier) {
+            self.error_token = self.current;
+            return error.ExpectedFunctionName;
+        }
+        const name_token = self.current;
+        self.advance();
+
+        if (self.current.token_type != .l_paren) {
+            self.error_token = self.current;
+            return error.ExpectedParameterList;
+        }
+        self.advance(); // consume '('
+
+        var params: std.ArrayList(FunctionParam) = .empty;
+        while (self.current.token_type != .r_paren) {
+            if (self.current.token_type != .identifier) {
+                self.error_token = self.current;
+                return error.ExpectedParameterName;
+            }
+            const param_name = self.current.lexeme;
+            self.advance();
+
+            if (self.current.token_type != .colon) {
+                self.error_token = self.current;
+                return error.ExpectedColonAfterParameter;
+            }
+            self.advance();
+
+            if (self.current.token_type != .identifier) {
+                self.error_token = self.current;
+                return error.ExpectedTypeName;
+            }
+            const param_type = try parseTypeName(self.current.lexeme);
+            if (param_type == .void) {
+                self.error_token = self.current;
+                return error.InvalidParameterType;
+            }
+            self.advance();
+
+            for (params.items) |existing| {
+                if (std.mem.eql(u8, existing.name, param_name)) {
+                    self.error_token = self.current;
+                    return error.ParameterAlreadyDefined;
+                }
+            }
+            try params.append(self.allocator, .{ .name = param_name, .ty = param_type });
+
+            if (self.current.token_type == .comma) {
+                self.advance();
+                continue;
+            }
+            if (self.current.token_type != .r_paren) {
+                self.error_token = self.current;
+                return error.ExpectedCommaOrClosingParen;
+            }
+        }
+        self.advance(); // consume ')'
+
+        var parsed_return_type: DataType = .void;
+        if (self.current.token_type == .arrow) {
+            self.advance();
+
+            if (self.current.token_type != .identifier) {
+                self.error_token = self.current;
+                return error.ExpectedTypeName;
+            }
+            parsed_return_type = try parseTypeName(self.current.lexeme);
+            self.advance();
+        }
+
+        if (self.current.token_type != .l_brace) {
+            self.error_token = self.current;
+            return error.ExpectedFunctionBody;
+        }
+
+        const signature = self.functions.get(name_token.lexeme) orelse {
+            self.error_token = name_token;
+            return error.UndefinedFunction;
+        };
+        if (signature.params.len != params.items.len) {
+            self.error_token = name_token;
+            return error.FunctionSignatureMismatch;
+        }
+        if (parsed_return_type != signature.return_type) {
+            self.error_token = name_token;
+            return error.FunctionSignatureMismatch;
+        }
+        for (params.items, 0..) |param, i| {
+            if (param.ty != signature.params[i].ty) {
+                self.error_token = name_token;
+                return error.FunctionSignatureMismatch;
+            }
+        }
+
+        try self.symbols.pushScope();
+        errdefer self.symbols.popScope();
+
+        const previous_scope_min = self.function_scope_min;
+        const previous_return_type = self.current_function_return_type;
+        self.function_scope_min = self.symbols.scopes.items.len - 1;
+        self.current_function_return_type = parsed_return_type;
+        defer {
+            self.function_scope_min = previous_scope_min;
+            self.current_function_return_type = previous_return_type;
+        }
+
+        for (params.items) |param| {
+            try self.symbols.define(param.name, param.ty);
+        }
+
+        const body = try self.parseBlockWithScope(false);
+        self.symbols.popScope();
+
+        var return_types: std.ArrayList(DataType) = .empty;
+        try collectReturnTypes(self, body, &return_types, self.allocator);
+        if (parsed_return_type == .void) {
+            if (return_types.items.len > 0 or hasExplicitReturn(body)) {
+                self.error_token = name_token;
+                return error.VoidFunctionCannotReturnValue;
+            }
+        } else {
+            if (return_types.items.len == 0) {
+                self.error_token = name_token;
+                return error.ExpectedExplicitReturn;
+            }
+            for (return_types.items) |ret_ty| {
+                if (!isTypeAssignable(parsed_return_type, ret_ty)) {
+                    self.error_token = name_token;
+                    return error.ReturnTypeMismatch;
+                }
+            }
+        }
+
+        const node = try self.allocator.create(Node);
+        node.* = .{
+            .span = .{ .start = fn_token.start, .end = body.span.end },
+            .data = .{ .function_def = .{
+                .name = name_token.lexeme,
+                .params = try params.toOwnedSlice(self.allocator),
+                .return_type = parsed_return_type,
+                .body = body,
+            } },
+        };
+        return node;
+    }
+
+    /// Parse the entire input as a top-level block node.
     pub fn parseProgram(self: *Parser) !*Node {
         var stmts: std.ArrayList(*Node) = .empty;
 
@@ -502,11 +989,13 @@ pub const ParsedAst = struct {
 
     // The user of this library only needs to call this once
     // to free the entire syntax tree.
+    /// Free all memory allocated for this parsed AST.
     pub fn deinit(self: *ParsedAst) void {
         self.arena.deinit();
     }
 };
 
+/// Parse source text into an arena-backed AST wrapper.
 pub fn programParse(input: []const u8, backing_allocator: std.mem.Allocator) !ParsedAst {
     // 1. Create an Arena Allocator wrapping the standard allocator.
     var arena = std.heap.ArenaAllocator.init(backing_allocator);
@@ -518,7 +1007,9 @@ pub fn programParse(input: []const u8, backing_allocator: std.mem.Allocator) !Pa
     // Every node, string slice, and array created using this allocator will live inside the arena.
     const arena_alloc = arena.allocator();
 
-    var parser = try Parser.init(input, arena_alloc);
+    const functions = try collectFunctionSignatures(input, arena_alloc);
+
+    var parser = try Parser.init(input, arena_alloc, functions);
     defer parser.deinit(); // Cleans up the SymbolTable's internal structures
 
     // 3. Parse the entire syntax tree.
@@ -548,4 +1039,146 @@ pub fn programParse(input: []const u8, backing_allocator: std.mem.Allocator) !Pa
         .arena = arena,
         .root = root,
     };
+}
+
+test "parses typed function definition and call" {
+    const testing = std.testing;
+    const source =
+        \\fn add(a: int, b: int) -> int {
+        \\    return a + b
+        \\}
+        \\add(2, 3)
+    ;
+
+    var ast = try programParse(source, testing.allocator);
+    defer ast.deinit();
+
+    try testing.expect(ast.root.data == .block);
+    const stmts = ast.root.data.block.statements;
+    try testing.expectEqual(@as(usize, 2), stmts.len);
+    try testing.expect(stmts[0].data == .function_def);
+    try testing.expect(stmts[1].data == .function_call);
+    try testing.expectEqualStrings("add", stmts[0].data.function_def.name);
+    try testing.expectEqual(@as(usize, 2), stmts[0].data.function_def.params.len);
+    try testing.expectEqual(DataType.int, stmts[0].data.function_def.return_type);
+}
+
+test "supports forward calls and mutual recursion" {
+    const testing = std.testing;
+    const source =
+        \\is_even(4)
+        \\fn is_even(n: int) -> boolean {
+        \\    if (n == 0) { return true } else { return is_odd(n - 1) }
+        \\}
+        \\fn is_odd(n: int) -> boolean {
+        \\    if (n == 0) { return false } else { return is_even(n - 1) }
+        \\}
+    ;
+
+    var ast = try programParse(source, testing.allocator);
+    defer ast.deinit();
+
+    try testing.expect(ast.root.data == .block);
+    try testing.expectEqual(@as(usize, 3), ast.root.data.block.statements.len);
+}
+
+test "rejects access to top-level variables from functions" {
+    const testing = std.testing;
+    const source =
+        \\x = 1
+        \\fn get_x() -> int {
+        \\    x
+        \\}
+        \\get_x()
+    ;
+
+    try testing.expectError(error.UndefinedVariable, programParse(source, testing.allocator));
+}
+
+test "rejects function calls with wrong argument type" {
+    const testing = std.testing;
+    const source =
+        \\fn halve(x: float) -> float {
+        \\    return x / 2.0
+        \\}
+        \\halve(true)
+    ;
+
+    try testing.expectError(error.ArgumentTypeMismatch, programParse(source, testing.allocator));
+}
+
+test "requires explicit return for non-void function" {
+    const testing = std.testing;
+    const source =
+        \\fn add(a: int, b: int) -> int {
+        \\    a + b
+        \\}
+        \\add(1, 2)
+    ;
+
+    try testing.expectError(error.ExpectedExplicitReturn, programParse(source, testing.allocator));
+}
+
+test "void function allowed when no return type and no return statement" {
+    const testing = std.testing;
+    const source =
+        \\fn spin(n: int) {
+        \\    i = 0
+        \\    while (i < n) {
+        \\        i` = i + 1
+        \\    }
+        \\}
+        \\spin(5)
+        \\42
+    ;
+
+    var ast = try programParse(source, testing.allocator);
+    defer ast.deinit();
+    try testing.expect(ast.root.data == .block);
+}
+
+test "void function cannot return value" {
+    const testing = std.testing;
+    const source =
+        \\fn bad() {
+        \\    return 1
+        \\}
+        \\0
+    ;
+
+    try testing.expectError(error.VoidFunctionCannotReturnValue, programParse(source, testing.allocator));
+}
+
+test "rejects missing parameter type annotation" {
+    const testing = std.testing;
+    const source =
+        \\fn bad_param(x) -> int {
+        \\    return x
+        \\}
+        \\bad_param(1)
+    ;
+
+    try testing.expectError(error.ExpectedColonAfterParameter, programParse(source, testing.allocator));
+}
+
+test "function with loop and prime assignments parses" {
+    const testing = std.testing;
+    const source =
+        \\fn fib_loop(n: int) -> int {
+        \\    a = 0
+        \\    b = 1
+        \\    i = 0
+        \\    while (i < n) {
+        \\        a` = b
+        \\        b` = a + b
+        \\        i` = i + 1
+        \\    }
+        \\    return a
+        \\}
+        \\fib_loop(10)
+    ;
+
+    var ast = try programParse(source, testing.allocator);
+    defer ast.deinit();
+    try testing.expect(ast.root.data == .block);
 }

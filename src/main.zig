@@ -1,8 +1,13 @@
+//! CLI entrypoint for GLP-ZCompiler.
+//! Reads `.dpl` input, parses into AST, and emits x86-64 assembly output.
 const std = @import("std");
 const parser_module = @import("parser.zig");
 const programParse = parser_module.programParse;
 const AsmGenerator = @import("asm_generator.zig").AsmGenerator;
 
+/// Compiler CLI entrypoint.
+///
+/// Usage: `glp_zcompiler <input.dpl> -o <output.s>`
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();

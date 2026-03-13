@@ -1,5 +1,8 @@
+//! Lexer for the `.dpl` language.
+//! Produces tokens with source spans used by the parser and diagnostics.
 const std = @import("std");
 
+/// Token categories recognized by the `.dpl` lexer.
 pub const TokenType = enum {
     // Literals & Identifiers
     number,
@@ -11,6 +14,9 @@ pub const TokenType = enum {
     star,
     slash,
     caret,
+    comma,
+    colon,
+    arrow,
     equal,
     equal_equal,
     not_equal,
@@ -42,23 +48,29 @@ pub const TokenType = enum {
     kw_and,
     kw_or,
     kw_while,
+    kw_fn,
+    kw_return,
 };
 
+/// A lexical token with byte-range span into the original source.
 pub const Token = struct {
     token_type: TokenType,
     lexeme: []const u8,
-    start: usize, // <-- Added for Span
-    end: usize, // <-- Added for Span
+    start: usize,
+    end: usize,
 };
 
+/// Stateful scanner over a source buffer.
 pub const Lexer = struct {
     input: []const u8,
     pos: usize,
 
+    /// Create a lexer for an input source buffer.
     pub fn init(input: []const u8) Lexer {
         return .{ .input = input, .pos = 0 };
     }
 
+    /// Return the next token and advance lexer state.
     pub fn next(self: *Lexer) Token {
         while (self.pos < self.input.len and (self.input[self.pos] == ' ' or self.input[self.pos] == '\t')) {
             self.pos += 1;
@@ -87,6 +99,10 @@ pub const Lexer = struct {
             },
             '-' => {
                 self.pos += 1;
+                if (self.pos < self.input.len and self.input[self.pos] == '>') {
+                    self.pos += 1;
+                    return self.makeToken(.arrow, start);
+                }
                 return self.makeToken(.minus, start);
             },
             '*' => {
@@ -100,6 +116,14 @@ pub const Lexer = struct {
             '^' => {
                 self.pos += 1;
                 return self.makeToken(.caret, start);
+            },
+            ',' => {
+                self.pos += 1;
+                return self.makeToken(.comma, start);
+            },
+            ':' => {
+                self.pos += 1;
+                return self.makeToken(.colon, start);
             },
             '=' => {
                 self.pos += 1;
@@ -166,6 +190,8 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, lexeme, "and")) return self.makeToken(.kw_and, start);
             if (std.mem.eql(u8, lexeme, "or")) return self.makeToken(.kw_or, start);
             if (std.mem.eql(u8, lexeme, "while")) return self.makeToken(.kw_while, start);
+            if (std.mem.eql(u8, lexeme, "fn")) return self.makeToken(.kw_fn, start);
+            if (std.mem.eql(u8, lexeme, "return")) return self.makeToken(.kw_return, start);
             return self.makeToken(.identifier, start);
         }
 

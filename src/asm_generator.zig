@@ -1,7 +1,10 @@
+//! AST-to-assembly backend for GLP-ZCompiler.
+//! Emits Intel-syntax x86-64 Linux assembly and handles int/float code paths.
 const std = @import("std");
 const parser = @import("parser.zig");
-const Node = parser.Node;
 const DataType = parser.DataType;
+const FunctionParam = parser.FunctionParam;
+const Node = parser.Node;
 
 /// The active "register" after evaluating a sub-expression.
 /// .int  → result is in rax  (integer 64-bit)
@@ -14,113 +17,134 @@ const VarInfo = struct {
     kind: RegKind,
 };
 
+const ScopeBinding = struct {
+    name: []const u8,
+    previous: ?VarInfo,
+};
+
+const frame_size: i32 = 4096;
+
 pub const AsmGenerator = struct {
     writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
     variables: std.StringHashMap(VarInfo),
     prime_slots: std.StringHashMap(VarInfo),
+    scope_stack: std.ArrayList(std.ArrayList(ScopeBinding)),
     stack_offset: i32,
     label_counter: u32,
-    /// Set to true after generating the last top-level expression so the
-    /// footer can choose the correct printf format string.
-    result_is_float: bool,
+    last_result_kind: RegKind,
+    current_return_label: ?u32,
+    current_function_return_type: ?DataType,
 
+    /// Create a backend instance bound to an output writer.
     pub fn init(writer: *std.Io.Writer, allocator: std.mem.Allocator) !AsmGenerator {
         return .{
             .writer = writer,
             .allocator = allocator,
             .variables = std.StringHashMap(VarInfo).init(allocator),
             .prime_slots = std.StringHashMap(VarInfo).init(allocator),
+            .scope_stack = .empty,
             .stack_offset = 0,
             .label_counter = 0,
-            .result_is_float = false,
+            .last_result_kind = .int,
+            .current_return_label = null,
+            .current_function_return_type = null,
         };
     }
 
+    /// Release backend-side maps and temporary state.
     pub fn deinit(self: *AsmGenerator) void {
+        for (self.scope_stack.items) |*scope| scope.deinit(self.allocator);
+        self.scope_stack.deinit(self.allocator);
         self.variables.deinit();
         self.prime_slots.deinit();
     }
 
-    pub fn generate(self: *AsmGenerator, root: *Node) !void {
+    /// Generate a complete assembly program from AST root.
+    pub fn generate(self: *AsmGenerator, root: *Node) anyerror!void {
         std.debug.print("[asm] generate: starting with root type={s}\n", .{@tagName(root.data)});
-        // First pass: figure out whether the last expression produces a float.
-        // We set result_is_float before writing the header so the rodata section
-        // can include the right format string.
+        try self.printPreamble();
+
         if (root.data == .block) {
-            const stmts = root.data.block.statements;
-            if (stmts.len > 0) {
-                const last = stmts[stmts.len - 1];
-                self.result_is_float = isFloatNode(last);
+            for (root.data.block.statements) |stmt| {
+                if (stmt.data == .function_def) {
+                    try self.generateFunction(stmt);
+                }
             }
         }
-        std.debug.print("[asm] generate: writing header (result_is_float={})...\n", .{self.result_is_float});
-        try self.printHeader();
-        std.debug.print("[asm] generate: writing body...\n", .{});
-        try self.generateNode(root);
-        std.debug.print("[asm] generate: writing footer...\n", .{});
-        try self.printFooter();
+
+        try self.printMainPrologue();
+        try self.resetFunctionState();
+        try self.beginScope();
+
+        var executed_top_level = false;
+        if (root.data == .block) {
+            for (root.data.block.statements) |stmt| {
+                if (stmt.data == .function_def) continue;
+                self.last_result_kind = try self.generateNode(stmt);
+                executed_top_level = true;
+            }
+        } else {
+            self.last_result_kind = try self.generateNode(root);
+            executed_top_level = true;
+        }
+
+        if (!executed_top_level) {
+            try self.writer.print("    mov rax, 0\n", .{});
+            self.last_result_kind = .int;
+        }
+
+        try self.endScope();
+        try self.printMainFooter();
         std.debug.print("[asm] generate: done\n", .{});
     }
 
-    fn printHeader(self: *AsmGenerator) !void {
-        // Choose the format string based on result type.
-        if (self.result_is_float) {
-            try self.writer.print(
-                \\    .intel_syntax noprefix
-                \\    .section .rodata
-                \\fmt:
-                \\    .string "Result: %f\n"
-                \\
-                \\    .section .text
-                \\    .globl main
-                \\
-                \\main:
-                \\    push rbp
-                \\    mov rbp, rsp
-                \\    sub rsp, 512
-                \\
-            , .{});
-        } else {
-            try self.writer.print(
-                \\    .intel_syntax noprefix
-                \\    .section .rodata
-                \\fmt:
-                \\    .string "Result: %ld\n"
-                \\
-                \\    .section .text
-                \\    .globl main
-                \\
-                \\main:
-                \\    push rbp
-                \\    mov rbp, rsp
-                \\    sub rsp, 512
-                \\
-            , .{});
-        }
+    fn printPreamble(self: *AsmGenerator) anyerror!void {
+        try self.writer.print(
+            \\    .intel_syntax noprefix
+            \\    .section .rodata
+            \\fmt_int:
+            \\    .string "Result: %ld\n"
+            \\fmt_float:
+            \\    .string "Result: %f\n"
+            \\
+            \\    .section .text
+            \\
+        , .{});
     }
 
-    fn printFooter(self: *AsmGenerator) !void {
-        if (self.result_is_float) {
-            // For printf with %f, the double must be passed in xmm0 and eax=1.
+    fn printMainPrologue(self: *AsmGenerator) anyerror!void {
+        try self.writer.print(
+            \\    .globl main
+            \\
+            \\main:
+            \\    push rbp
+            \\    mov rbp, rsp
+            \\    sub rsp, {d}
+            \\
+        , .{frame_size});
+    }
+
+    fn printMainFooter(self: *AsmGenerator) anyerror!void {
+        if (self.last_result_kind == .float) {
             try self.writer.print(
-                \\    lea rdi, [rip + fmt]    # First arg: format string
-                \\    mov eax, 1              # 1 XMM register used for varargs
+                \\    lea rdi, [rip + fmt_float]
+                \\    mov eax, 1
                 \\    call printf@PLT
                 \\
-                \\    xor eax, eax            # Return 0
+                \\    xor eax, eax
                 \\    leave
                 \\    ret
                 \\
             , .{});
         } else {
             try self.writer.print(
-                \\    lea rdi, [rip + fmt]    # First arg: format string
-                \\    mov rsi, rax            # Second arg: result
-                \\    xor eax, eax            # printf expects 0 in EAX for varargs
+                \\    lea rdi, [rip + fmt_int]
+                \\    mov rsi, rax
+                \\    xor eax, eax
                 \\    call printf@PLT
                 \\
-                \\    xor eax, eax            # Return 0
+                \\    xor eax, eax
                 \\    leave
                 \\    ret
                 \\
@@ -128,128 +152,265 @@ pub const AsmGenerator = struct {
         }
     }
 
-    /// Returns true when the top-level node will leave its result in xmm0.
-    fn isFloatNode(node: *const Node) bool {
-        return switch (node.data) {
-            .literal => |lit| switch (lit) {
-                .float => true,
-                else => false,
-            },
-            .variable => false, // conservative; runtime type known via VarInfo
-            .binary => |b| switch (b.op) {
-                // Comparison / logical → always int (0/1)
-                .equal_equal, .not_equal, .lt, .gt, .lt_equal, .gt_equal, .kw_and, .kw_or => false,
-                else => isFloatNode(b.left) or isFloatNode(b.right),
-            },
-            .unary => false,
-            .assignment => |a| isFloatNode(a.value),
-            .prime_assignment => |pa| isFloatNode(pa.value),
-            .block => |bl| blk: {
-                if (bl.statements.len == 0) break :blk false;
-                break :blk isFloatNode(bl.statements[bl.statements.len - 1]);
-            },
-            else => false,
+    fn resetFunctionState(self: *AsmGenerator) anyerror!void {
+        self.variables.clearRetainingCapacity();
+        self.prime_slots.clearRetainingCapacity();
+        for (self.scope_stack.items) |*scope| scope.deinit(self.allocator);
+        self.scope_stack.clearRetainingCapacity();
+        self.stack_offset = 0;
+        self.last_result_kind = .int;
+        self.current_return_label = null;
+        self.current_function_return_type = null;
+    }
+
+    fn beginScope(self: *AsmGenerator) anyerror!void {
+        try self.scope_stack.append(self.allocator, .empty);
+    }
+
+    fn endScope(self: *AsmGenerator) anyerror!void {
+        var scope = self.scope_stack.pop().?;
+        defer scope.deinit(self.allocator);
+
+        var i = scope.items.len;
+        while (i > 0) {
+            i -= 1;
+            const binding = scope.items[i];
+            if (binding.previous) |previous| {
+                try self.variables.put(binding.name, previous);
+            } else {
+                _ = self.variables.remove(binding.name);
+            }
+        }
+    }
+
+    fn bindVariable(self: *AsmGenerator, name: []const u8, info: VarInfo) anyerror!void {
+        const previous = self.variables.get(name);
+        try self.scope_stack.items[self.scope_stack.items.len - 1].append(self.allocator, .{
+            .name = name,
+            .previous = previous,
+        });
+        try self.variables.put(name, info);
+    }
+
+    fn reserveSlot(self: *AsmGenerator, kind: RegKind) anyerror!VarInfo {
+        self.stack_offset += 8;
+        if (self.stack_offset > frame_size) return error.StackFrameTooLarge;
+        return .{ .offset = self.stack_offset, .kind = kind };
+    }
+
+    fn dataTypeToRegKind(ty: DataType) RegKind {
+        return switch (ty) {
+            .float => .float,
+            else => .int,
         };
     }
 
-    fn generateNode(self: *AsmGenerator, node: *Node) !void {
-        std.debug.print("[asm] generateNode: type={s}", .{@tagName(node.data)});
-
-        switch (node.data) {
-            .assignment => |a| std.debug.print(" target='{s}'", .{a.target}),
-            .variable => |v| std.debug.print(" name='{s}'", .{v}),
-            .literal => |l| {
-                switch (l) {
-                    .int => |n| std.debug.print(" value(int)={d}", .{n}),
-                    .float => |n| std.debug.print(" value(float)={d}", .{n}),
-                    else => std.debug.print(" value=unsupported_literal", .{}),
-                }
+    fn nodeType(node: *const Node) DataType {
+        return switch (node.data) {
+            .literal => |lit| switch (lit) {
+                .float => .float,
+                .boolean => .boolean,
+                .string => .string,
+                else => .int,
             },
-            .binary => |b| std.debug.print(" op='{s}'", .{@tagName(b.op)}),
-            .block => |b| std.debug.print(" stmts={d}", .{b.statements.len}),
-            .unary => |u| std.debug.print(" op='{s}'", .{@tagName(u.op)}),
-            .if_statement => std.debug.print(" (if statement)", .{}),
-            .while_loop => |wl| std.debug.print(" prime_vars={d}", .{wl.prime_vars.len}),
-            .prime_assignment => |pa| std.debug.print(" target='{s}'", .{pa.target}),
+            .variable => |var_ref| var_ref.ty,
+            .function_call => |call| call.return_type,
+            .assignment => |assign| nodeType(assign.value),
+            .prime_assignment => |assign| nodeType(assign.value),
+            .unary => .boolean,
+            .binary => |binary| switch (binary.op) {
+                .equal_equal, .not_equal, .lt, .gt, .lt_equal, .gt_equal, .kw_and, .kw_or => .boolean,
+                else => blk: {
+                    const left_ty = nodeType(binary.left);
+                    const right_ty = nodeType(binary.right);
+                    break :blk if (left_ty == .float or right_ty == .float) .float else .int;
+                },
+            },
+            .block => |block| blk: {
+                if (block.statements.len == 0) break :blk .int;
+                break :blk nodeType(block.statements[block.statements.len - 1]);
+            },
+            .if_statement => |stmt| nodeType(stmt.then_branch),
+            else => .int,
+        };
+    }
+
+    fn convertResultToType(self: *AsmGenerator, from: RegKind, to: DataType) anyerror!RegKind {
+        const target = dataTypeToRegKind(to);
+        if (from == target) return from;
+
+        switch (target) {
+            .float => {
+                try self.writer.print("    cvtsi2sd xmm0, rax\n", .{});
+                return .float;
+            },
+            .int => {
+                try self.writer.print("    cvttsd2si rax, xmm0\n", .{});
+                return .int;
+            },
         }
-        std.debug.print("\n", .{});
+    }
+
+    fn generateFunction(self: *AsmGenerator, node: *Node) anyerror!void {
+        const function = node.data.function_def;
+        std.debug.print("[asm] generateFunction: {s}\n", .{function.name});
+
+        try self.resetFunctionState();
+        try self.beginScope();
+
+        try self.writer.print(
+            \\    .globl {s}
+            \\{s}:
+            \\    push rbp
+            \\    mov rbp, rsp
+            \\    sub rsp, {d}
+            \\
+        , .{ function.name, function.name, frame_size });
+
+        const return_label_id = self.label_counter;
+        self.label_counter += 1;
+        self.current_return_label = return_label_id;
+        self.current_function_return_type = function.return_type;
+
+        try self.bindParameters(function.params);
+        _ = try self.generateFunctionBody(function.body);
+
+        try self.writer.print(".Lfn_return_{d}:\n", .{return_label_id});
+        try self.endScope();
+        try self.writer.print(
+            \\    leave
+            \\    ret
+            \\
+        , .{});
+
+        self.current_return_label = null;
+        self.current_function_return_type = null;
+    }
+
+    fn bindParameters(self: *AsmGenerator, params: []const FunctionParam) anyerror!void {
+        const int_regs = [_][]const u8{ "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
+        const float_regs = [_][]const u8{ "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7" };
+        var int_index: usize = 0;
+        var float_index: usize = 0;
+
+        for (params) |param| {
+            const kind = dataTypeToRegKind(param.ty);
+            const slot = try self.reserveSlot(kind);
+            try self.bindVariable(param.name, slot);
+            switch (kind) {
+                .int => {
+                    if (int_index >= int_regs.len) return error.UnsupportedFunctionParameterCount;
+                    try self.writer.print("    mov [rbp - {d}], {s}\n", .{ slot.offset, int_regs[int_index] });
+                    int_index += 1;
+                },
+                .float => {
+                    if (float_index >= float_regs.len) return error.UnsupportedFunctionParameterCount;
+                    try self.writer.print("    movsd [rbp - {d}], {s}\n", .{ slot.offset, float_regs[float_index] });
+                    float_index += 1;
+                },
+            }
+        }
+    }
+
+    fn generateFunctionBody(self: *AsmGenerator, body: *Node) anyerror!RegKind {
+        return switch (body.data) {
+            .block => |block| try self.generateBlockStatements(block.statements, false),
+            else => try self.generateNode(body),
+        };
+    }
+
+    fn generateBlockStatements(self: *AsmGenerator, statements: []const *Node, create_scope: bool) anyerror!RegKind {
+        if (create_scope) try self.beginScope();
+        defer if (create_scope) self.endScope() catch {};
+
+        var last_kind: RegKind = .int;
+        if (statements.len == 0) {
+            try self.writer.print("    mov rax, 0\n", .{});
+            return .int;
+        }
+
+        for (statements) |stmt| {
+            last_kind = try self.generateNode(stmt);
+        }
+        return last_kind;
+    }
+
+    fn generateNode(self: *AsmGenerator, node: *Node) anyerror!RegKind {
+        std.debug.print("[asm] generateNode: type={s}\n", .{@tagName(node.data)});
 
         switch (node.data) {
-            .block => |b| {
-                std.debug.print("[asm]   block: processing {d} statement(s)\n", .{b.statements.len});
-                for (b.statements, 0..) |stmt, i| {
-                    std.debug.print("[asm]   block: statement [{d}]\n", .{i});
-                    try self.generateNode(stmt);
-                }
-            },
-            .assignment => |a| {
-                std.debug.print("[asm]   assignment: evaluating RHS for '{s}'\n", .{a.target});
-                const kind = try self.generateExpr(a.value);
-                self.stack_offset += 8;
-                const info = VarInfo{ .offset = self.stack_offset, .kind = kind };
-                try self.variables.put(a.target, info);
-                std.debug.print("[asm]   assignment: '{s}' stored at [rbp - {d}] ({s})\n", .{ a.target, self.stack_offset, @tagName(kind) });
+            .block => |block| return self.generateBlockStatements(block.statements, true),
+            .assignment => |assign| {
+                const kind = try self.generateExpr(assign.value);
+                const slot = try self.reserveSlot(kind);
+                try self.bindVariable(assign.target, slot);
                 switch (kind) {
-                    .int => try self.writer.print("    mov [rbp - {d}], rax\n", .{self.stack_offset}),
-                    .float => try self.writer.print("    movsd [rbp - {d}], xmm0\n", .{self.stack_offset}),
+                    .int => try self.writer.print("    mov [rbp - {d}], rax\n", .{slot.offset}),
+                    .float => try self.writer.print("    movsd [rbp - {d}], xmm0\n", .{slot.offset}),
                 }
+                return kind;
             },
-            .variable => |name| {
-                const info = self.variables.get(name).?;
-                std.debug.print("[asm]   variable: '{s}' loaded from [rbp - {d}] ({s})\n", .{ name, info.offset, @tagName(info.kind) });
-                switch (info.kind) {
-                    .int => try self.writer.print("    mov rax, [rbp - {d}]\n", .{info.offset}),
-                    .float => try self.writer.print("    movsd xmm0, [rbp - {d}]\n", .{info.offset}),
-                }
-            },
-            // Expressions: delegate to generateExpr (result discarded)
-            .binary, .literal, .unary => {
-                _ = try self.generateExpr(node);
-            },
+            .variable, .binary, .literal, .unary, .function_call => return self.generateExpr(node),
             .if_statement => |if_stmt| {
                 const label_id = self.label_counter;
                 self.label_counter += 1;
 
-                // Evaluate the condition — result goes into rax (conditions are always int)
                 _ = try self.generateExpr(if_stmt.condition);
                 try self.writer.print("    cmp rax, 0\n", .{});
 
                 if (if_stmt.else_branch) |else_branch| {
                     try self.writer.print("    je .Lelse_{d}\n", .{label_id});
-                    try self.generateNode(if_stmt.then_branch);
+                    const then_kind = try self.generateNode(if_stmt.then_branch);
                     try self.writer.print("    jmp .Lend_{d}\n", .{label_id});
                     try self.writer.print(".Lelse_{d}:\n", .{label_id});
-                    try self.generateNode(else_branch);
+                    const else_kind = try self.generateNode(else_branch);
+                    if (then_kind != else_kind) return error.MismatchedBranchResultKinds;
                     try self.writer.print(".Lend_{d}:\n", .{label_id});
-                } else {
-                    try self.writer.print("    je .Lend_{d}\n", .{label_id});
-                    try self.generateNode(if_stmt.then_branch);
-                    try self.writer.print(".Lend_{d}:\n", .{label_id});
+                    return then_kind;
                 }
+
+                try self.writer.print("    je .Lend_{d}\n", .{label_id});
+                _ = try self.generateNode(if_stmt.then_branch);
+                try self.writer.print(".Lend_{d}:\n", .{label_id});
+                try self.writer.print("    mov rax, 0\n", .{});
+                return .int;
             },
             .while_loop => |wl| {
                 const label_id = self.label_counter;
                 self.label_counter += 1;
 
-                // Allocate prime slots.  Infer kind from the corresponding variable.
+                var previous_slots: std.ArrayList(struct {
+                    name: []const u8,
+                    previous: ?VarInfo,
+                }) = .empty;
+                defer previous_slots.deinit(self.allocator);
+
                 for (wl.prime_vars) |name| {
-                    self.stack_offset += 8;
-                    const orig_info = self.variables.get(name) orelse VarInfo{ .offset = 0, .kind = .int };
-                    const slot_info = VarInfo{ .offset = self.stack_offset, .kind = orig_info.kind };
-                    try self.prime_slots.put(name, slot_info);
-                    std.debug.print("[asm]   while_loop: prime slot for '{s}' at [rbp - {d}] ({s})\n", .{ name, self.stack_offset, @tagName(slot_info.kind) });
+                    const orig_info = self.variables.get(name) orelse return error.UndefinedVariable;
+                    const slot = try self.reserveSlot(orig_info.kind);
+                    try previous_slots.append(self.allocator, .{ .name = name, .previous = self.prime_slots.get(name) });
+                    try self.prime_slots.put(name, slot);
+                }
+                defer {
+                    var i = previous_slots.items.len;
+                    while (i > 0) {
+                        i -= 1;
+                        const prev = previous_slots.items[i];
+                        if (prev.previous) |info| {
+                            self.prime_slots.put(prev.name, info) catch {};
+                        } else {
+                            _ = self.prime_slots.remove(prev.name);
+                        }
+                    }
                 }
 
                 try self.writer.print(".Lloop_start_{d}:\n", .{label_id});
-
-                // Condition — always integer comparison.
                 _ = try self.generateExpr(wl.condition);
                 try self.writer.print("    cmp rax, 0\n", .{});
                 try self.writer.print("    je .Lloop_end_{d}\n", .{label_id});
 
-                try self.generateNode(wl.body);
+                _ = try self.generateNode(wl.body);
 
-                // Simultaneous update of old slots from prime (new) slots.
                 for (wl.prime_vars) |name| {
                     const old_info = self.variables.get(name).?;
                     const new_info = self.prime_slots.get(name).?;
@@ -267,25 +428,31 @@ pub const AsmGenerator = struct {
 
                 try self.writer.print("    jmp .Lloop_start_{d}\n", .{label_id});
                 try self.writer.print(".Lloop_end_{d}:\n", .{label_id});
-
-                for (wl.prime_vars) |name| {
-                    _ = self.prime_slots.remove(name);
-                }
+                try self.writer.print("    mov rax, 0\n", .{});
+                return .int;
             },
-            .prime_assignment => |pa| {
-                std.debug.print("[asm]   prime_assignment: evaluating RHS for '{s}'\n", .{pa.target});
-                const kind = try self.generateExpr(pa.value);
-                const new_info = self.prime_slots.get(pa.target).?;
-                std.debug.print("[asm]   prime_assignment: '{s}' -> [rbp - {d}] ({s})\n", .{ pa.target, new_info.offset, @tagName(kind) });
+            .prime_assignment => |assign| {
+                const kind = try self.generateExpr(assign.value);
+                const slot = self.prime_slots.get(assign.target).?;
                 switch (kind) {
-                    .int => try self.writer.print("    mov [rbp - {d}], rax\n", .{new_info.offset}),
-                    .float => try self.writer.print("    movsd [rbp - {d}], xmm0\n", .{new_info.offset}),
+                    .int => try self.writer.print("    mov [rbp - {d}], rax\n", .{slot.offset}),
+                    .float => try self.writer.print("    movsd [rbp - {d}], xmm0\n", .{slot.offset}),
                 }
+                return kind;
             },
+            .return_statement => |ret_stmt| {
+                const ret_kind = try self.generateExpr(ret_stmt.value);
+                const expected = self.current_function_return_type orelse return error.ReturnOutsideFunction;
+                _ = try self.convertResultToType(ret_kind, expected);
+                const label_id = self.current_return_label orelse return error.ReturnOutsideFunction;
+                try self.writer.print("    jmp .Lfn_return_{d}\n", .{label_id});
+                return dataTypeToRegKind(expected);
+            },
+            .function_def => return .int,
         }
     }
 
-    /// Generate code for an expression node.  Returns RegKind indicating
+    /// Generate code for an expression node. Returns RegKind indicating
     /// whether the result ended up in rax (.int) or xmm0 (.float).
     fn generateExpr(self: *AsmGenerator, node: *Node) anyerror!RegKind {
         switch (node.data) {
@@ -296,8 +463,6 @@ pub const AsmGenerator = struct {
                         return .int;
                     },
                     .float => |val| {
-                        // Embed the bit-pattern of the double as a 64-bit immediate via a
-                        // temporary integer register, then move to xmm0.
                         const bits: u64 = @bitCast(val);
                         try self.writer.print("    mov rax, {d}    # float bits: {d}\n", .{ bits, val });
                         try self.writer.print("    movq xmm0, rax\n", .{});
@@ -307,14 +472,11 @@ pub const AsmGenerator = struct {
                         try self.writer.print("    mov rax, {d}\n", .{@as(i64, if (val) 1 else 0)});
                         return .int;
                     },
-                    else => {
-                        std.debug.print("Code Generation for this literal type is not implemented yet.\n", .{});
-                        return error.UnsupportedLiteralType;
-                    },
+                    else => return error.UnsupportedLiteralType,
                 }
             },
-            .variable => |name| {
-                const info = self.variables.get(name).?;
+            .variable => |var_ref| {
+                const info = self.variables.get(var_ref.name).?;
                 switch (info.kind) {
                     .int => {
                         try self.writer.print("    mov rax, [rbp - {d}]\n", .{info.offset});
@@ -326,10 +488,10 @@ pub const AsmGenerator = struct {
                     },
                 }
             },
+            .function_call => |call| return self.generateCall(call.name, call.args, call.param_types, call.return_type),
             .binary => |b| {
                 const left_kind = try self.generateExpr(b.left);
 
-                // Push left operand onto stack (always 8 bytes regardless of type).
                 switch (left_kind) {
                     .int => try self.writer.print("    push rax\n", .{}),
                     .float => {
@@ -339,28 +501,19 @@ pub const AsmGenerator = struct {
                 }
 
                 const right_kind = try self.generateExpr(b.right);
-
-                // Promote mixed int/float: if one is float, convert the other.
                 const result_kind: RegKind = blk: {
                     switch (b.op) {
-                        // Comparisons / logical always produce an int result.
                         .equal_equal, .not_equal, .lt, .gt, .lt_equal, .gt_equal, .kw_and, .kw_or => break :blk .int,
                         else => break :blk if (left_kind == .float or right_kind == .float) .float else .int,
                     }
                 };
 
                 if (result_kind == .float) {
-                    // Pop left into xmm1, ensure right is in xmm0.
                     switch (right_kind) {
-                        .int => {
-                            // right is in rax → xmm0
-                            try self.writer.print("    cvtsi2sd xmm0, rax\n", .{});
-                        },
-                        .float => {}, // right already in xmm0
+                        .int => try self.writer.print("    cvtsi2sd xmm0, rax\n", .{}),
+                        .float => {},
                     }
-                    // Pop left → xmm1
                     if (left_kind == .int) {
-                        // left was pushed as integer
                         try self.writer.print("    pop rax\n", .{});
                         try self.writer.print("    cvtsi2sd xmm1, rax\n", .{});
                     } else {
@@ -374,29 +527,24 @@ pub const AsmGenerator = struct {
                         .star => try self.writer.print("    mulsd xmm1, xmm0\n", .{}),
                         .slash => try self.writer.print("    divsd xmm1, xmm0\n", .{}),
                         .caret => {
-                            // pow(xmm1, xmm0) — arguments already in xmm0/xmm1 need reordering:
-                            // System V ABI: first arg xmm0, second arg xmm1.
                             try self.writer.print("    movapd xmm0, xmm1\n", .{});
                             try self.writer.print("    call pow@PLT\n", .{});
                         },
                         else => unreachable,
                     }
-                    // Move result to xmm0 (for non-pow ops result is in xmm1).
+
                     switch (b.op) {
-                        .caret => {}, // result already in xmm0
+                        .caret => {},
                         else => try self.writer.print("    movapd xmm0, xmm1\n", .{}),
                     }
                     return .float;
-                } else if (result_kind == .int and (b.op == .equal_equal or b.op == .not_equal or
-                    b.op == .lt or b.op == .gt or b.op == .lt_equal or b.op == .gt_equal))
-                {
-                    // Comparison: both operands may be int or float.
+                }
+
+                if (b.op == .equal_equal or b.op == .not_equal or b.op == .lt or b.op == .gt or b.op == .lt_equal or b.op == .gt_equal) {
                     if (left_kind == .float or right_kind == .float) {
-                        // Float comparison path.
                         if (right_kind == .int) {
                             try self.writer.print("    cvtsi2sd xmm1, rax\n", .{});
                         } else {
-                            // right is in xmm0 → save to xmm1
                             try self.writer.print("    movapd xmm1, xmm0\n", .{});
                         }
                         if (left_kind == .int) {
@@ -406,120 +554,77 @@ pub const AsmGenerator = struct {
                             try self.writer.print("    movsd xmm0, [rsp]\n", .{});
                             try self.writer.print("    add rsp, 8\n", .{});
                         }
-                        // Now: left in xmm0, right in xmm1.
                         try self.writer.print("    ucomisd xmm0, xmm1\n", .{});
                         switch (b.op) {
-                            .equal_equal => {
-                                try self.writer.print("    sete al\n", .{});
-                                try self.writer.print("    movzx rax, al\n", .{});
-                            },
-                            .not_equal => {
-                                try self.writer.print("    setne al\n", .{});
-                                try self.writer.print("    movzx rax, al\n", .{});
-                            },
-                            .lt => {
-                                try self.writer.print("    setb al\n", .{});
-                                try self.writer.print("    movzx rax, al\n", .{});
-                            },
-                            .gt => {
-                                try self.writer.print("    seta al\n", .{});
-                                try self.writer.print("    movzx rax, al\n", .{});
-                            },
-                            .lt_equal => {
-                                try self.writer.print("    setbe al\n", .{});
-                                try self.writer.print("    movzx rax, al\n", .{});
-                            },
-                            .gt_equal => {
-                                try self.writer.print("    setae al\n", .{});
-                                try self.writer.print("    movzx rax, al\n", .{});
-                            },
+                            .equal_equal => try self.writer.print("    sete al\n", .{}),
+                            .not_equal => try self.writer.print("    setne al\n", .{}),
+                            .lt => try self.writer.print("    setb al\n", .{}),
+                            .gt => try self.writer.print("    seta al\n", .{}),
+                            .lt_equal => try self.writer.print("    setbe al\n", .{}),
+                            .gt_equal => try self.writer.print("    setae al\n", .{}),
                             else => unreachable,
                         }
+                        try self.writer.print("    movzx rax, al\n", .{});
                     } else {
-                        // Integer comparison.
-                        try self.writer.print("    mov rbx, rax\n", .{});
+                        try self.writer.print("    mov r10, rax\n", .{});
                         try self.writer.print("    pop rax\n", .{});
+                        try self.writer.print("    cmp rax, r10\n", .{});
                         switch (b.op) {
-                            .equal_equal => {
-                                try self.writer.print("    cmp rax, rbx\n", .{});
-                                try self.writer.print("    sete al\n", .{});
-                                try self.writer.print("    movzx rax, al\n", .{});
-                            },
-                            .not_equal => {
-                                try self.writer.print("    cmp rax, rbx\n", .{});
-                                try self.writer.print("    setne al\n", .{});
-                                try self.writer.print("    movzx rax, al\n", .{});
-                            },
-                            .lt => {
-                                try self.writer.print("    cmp rax, rbx\n", .{});
-                                try self.writer.print("    setl al\n", .{});
-                                try self.writer.print("    movzx rax, al\n", .{});
-                            },
-                            .gt => {
-                                try self.writer.print("    cmp rax, rbx\n", .{});
-                                try self.writer.print("    setg al\n", .{});
-                                try self.writer.print("    movzx rax, al\n", .{});
-                            },
-                            .lt_equal => {
-                                try self.writer.print("    cmp rax, rbx\n", .{});
-                                try self.writer.print("    setle al\n", .{});
-                                try self.writer.print("    movzx rax, al\n", .{});
-                            },
-                            .gt_equal => {
-                                try self.writer.print("    cmp rax, rbx\n", .{});
-                                try self.writer.print("    setge al\n", .{});
-                                try self.writer.print("    movzx rax, al\n", .{});
-                            },
+                            .equal_equal => try self.writer.print("    sete al\n", .{}),
+                            .not_equal => try self.writer.print("    setne al\n", .{}),
+                            .lt => try self.writer.print("    setl al\n", .{}),
+                            .gt => try self.writer.print("    setg al\n", .{}),
+                            .lt_equal => try self.writer.print("    setle al\n", .{}),
+                            .gt_equal => try self.writer.print("    setge al\n", .{}),
                             else => unreachable,
                         }
-                    }
-                    return .int;
-                } else {
-                    // Pure integer arithmetic.
-                    try self.writer.print("    mov rbx, rax\n", .{});
-                    try self.writer.print("    pop rax\n", .{});
-                    switch (b.op) {
-                        .plus => try self.writer.print("    add rax, rbx\n", .{}),
-                        .minus => try self.writer.print("    sub rax, rbx\n", .{}),
-                        .star => try self.writer.print("    imul rax, rbx\n", .{}),
-                        .slash => {
-                            try self.writer.print("    cqo\n", .{});
-                            try self.writer.print("    idiv rbx\n", .{});
-                        },
-                        .caret => {
-                            try self.writer.print("    cvtsi2sd xmm0, rax      # Convert base to double\n", .{});
-                            try self.writer.print("    cvtsi2sd xmm1, rbx      # Convert exponent to double\n", .{});
-                            try self.writer.print("    call pow@PLT\n", .{});
-                            try self.writer.print("    cvttsd2si rax, xmm0     # Convert result back to integer\n", .{});
-                        },
-                        .kw_and => {
-                            try self.writer.print("    test rax, rax\n", .{});
-                            try self.writer.print("    setne al\n", .{});
-                            try self.writer.print("    movzx rax, al\n", .{});
-                            try self.writer.print("    test rbx, rbx\n", .{});
-                            try self.writer.print("    setne cl\n", .{});
-                            try self.writer.print("    and al, cl\n", .{});
-                            try self.writer.print("    movzx rax, al\n", .{});
-                        },
-                        .kw_or => {
-                            try self.writer.print("    test rax, rax\n", .{});
-                            try self.writer.print("    setne al\n", .{});
-                            try self.writer.print("    movzx rax, al\n", .{});
-                            try self.writer.print("    test rbx, rbx\n", .{});
-                            try self.writer.print("    setne cl\n", .{});
-                            try self.writer.print("    or al, cl\n", .{});
-                            try self.writer.print("    movzx rax, al\n", .{});
-                        },
-                        else => unreachable,
+                        try self.writer.print("    movzx rax, al\n", .{});
                     }
                     return .int;
                 }
+
+                try self.writer.print("    mov r10, rax\n", .{});
+                try self.writer.print("    pop rax\n", .{});
+                switch (b.op) {
+                    .plus => try self.writer.print("    add rax, r10\n", .{}),
+                    .minus => try self.writer.print("    sub rax, r10\n", .{}),
+                    .star => try self.writer.print("    imul rax, r10\n", .{}),
+                    .slash => {
+                        try self.writer.print("    cqo\n", .{});
+                        try self.writer.print("    idiv r10\n", .{});
+                    },
+                    .caret => {
+                        try self.writer.print("    cvtsi2sd xmm0, rax\n", .{});
+                        try self.writer.print("    cvtsi2sd xmm1, r10\n", .{});
+                        try self.writer.print("    call pow@PLT\n", .{});
+                        try self.writer.print("    cvttsd2si rax, xmm0\n", .{});
+                    },
+                    .kw_and => {
+                        try self.writer.print("    test rax, rax\n", .{});
+                        try self.writer.print("    setne al\n", .{});
+                        try self.writer.print("    movzx rax, al\n", .{});
+                        try self.writer.print("    test r10, r10\n", .{});
+                        try self.writer.print("    setne r11b\n", .{});
+                        try self.writer.print("    and al, r11b\n", .{});
+                        try self.writer.print("    movzx rax, al\n", .{});
+                    },
+                    .kw_or => {
+                        try self.writer.print("    test rax, rax\n", .{});
+                        try self.writer.print("    setne al\n", .{});
+                        try self.writer.print("    movzx rax, al\n", .{});
+                        try self.writer.print("    test r10, r10\n", .{});
+                        try self.writer.print("    setne r11b\n", .{});
+                        try self.writer.print("    or al, r11b\n", .{});
+                        try self.writer.print("    movzx rax, al\n", .{});
+                    },
+                    else => unreachable,
+                }
+                return .int;
             },
             .unary => |u| {
                 const kind = try self.generateExpr(u.operand);
                 switch (u.op) {
                     .bang => {
-                        // Logical NOT works on truth value — convert float to int first if needed.
                         if (kind == .float) {
                             try self.writer.print("    xorpd xmm1, xmm1\n", .{});
                             try self.writer.print("    ucomisd xmm0, xmm1\n", .{});
@@ -535,11 +640,52 @@ pub const AsmGenerator = struct {
                     else => unreachable,
                 }
             },
-            else => {
-                // For statement-level nodes called from generateNode, delegate back.
-                try self.generateNode(node);
-                return .int;
-            },
+            else => return self.generateNode(node),
         }
+    }
+
+    fn generateCall(self: *AsmGenerator, name: []const u8, args: []const *Node, param_types: []const DataType, return_type: DataType) anyerror!RegKind {
+        const int_regs = [_][]const u8{ "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
+        const float_regs = [_][]const u8{ "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7" };
+        var int_count: usize = 0;
+        var float_count: usize = 0;
+
+        var i = args.len;
+        while (i > 0) {
+            i -= 1;
+            const arg_kind = try self.generateExpr(args[i]);
+            const converted = try self.convertResultToType(arg_kind, param_types[i]);
+            switch (converted) {
+                .int => try self.writer.print("    push rax\n", .{}),
+                .float => {
+                    try self.writer.print("    sub rsp, 8\n", .{});
+                    try self.writer.print("    movsd [rsp], xmm0\n", .{});
+                },
+            }
+        }
+
+        for (param_types) |param_type| {
+            const kind = dataTypeToRegKind(param_type);
+            switch (kind) {
+                .int => {
+                    if (int_count >= int_regs.len) return error.UnsupportedFunctionParameterCount;
+                    try self.writer.print("    pop {s}\n", .{int_regs[int_count]});
+                    int_count += 1;
+                },
+                .float => {
+                    if (float_count >= float_regs.len) return error.UnsupportedFunctionParameterCount;
+                    try self.writer.print("    movsd {s}, [rsp]\n", .{float_regs[float_count]});
+                    try self.writer.print("    add rsp, 8\n", .{});
+                    float_count += 1;
+                },
+            }
+        }
+
+        try self.writer.print("    call {s}\n", .{name});
+        if (return_type == .void) {
+            try self.writer.print("    mov rax, 0\n", .{});
+            return .int;
+        }
+        return dataTypeToRegKind(return_type);
     }
 };
