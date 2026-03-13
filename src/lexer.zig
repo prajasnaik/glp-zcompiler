@@ -14,6 +14,9 @@ pub const TokenType = enum {
     star,
     slash,
     caret,
+    comma,
+    colon,
+    arrow,
     equal,
     equal_equal,
     not_equal,
@@ -45,6 +48,7 @@ pub const TokenType = enum {
     kw_and,
     kw_or,
     kw_while,
+    kw_fn,
 };
 
 /// A lexical token with byte-range span into the original source.
@@ -94,6 +98,10 @@ pub const Lexer = struct {
             },
             '-' => {
                 self.pos += 1;
+                if (self.pos < self.input.len and self.input[self.pos] == '>') {
+                    self.pos += 1;
+                    return self.makeToken(.arrow, start);
+                }
                 return self.makeToken(.minus, start);
             },
             '*' => {
@@ -107,6 +115,14 @@ pub const Lexer = struct {
             '^' => {
                 self.pos += 1;
                 return self.makeToken(.caret, start);
+            },
+            ',' => {
+                self.pos += 1;
+                return self.makeToken(.comma, start);
+            },
+            ':' => {
+                self.pos += 1;
+                return self.makeToken(.colon, start);
             },
             '=' => {
                 self.pos += 1;
@@ -173,6 +189,7 @@ pub const Lexer = struct {
             if (std.mem.eql(u8, lexeme, "and")) return self.makeToken(.kw_and, start);
             if (std.mem.eql(u8, lexeme, "or")) return self.makeToken(.kw_or, start);
             if (std.mem.eql(u8, lexeme, "while")) return self.makeToken(.kw_while, start);
+            if (std.mem.eql(u8, lexeme, "fn")) return self.makeToken(.kw_fn, start);
             return self.makeToken(.identifier, start);
         }
 
