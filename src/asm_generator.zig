@@ -3,6 +3,20 @@ const parser = @import("parser.zig");
 const Node = parser.Node;
 const DataType = parser.DataType;
 
+const MapEntry = struct {
+    label: []const u8,
+    line: usize,
+};
+
+fn computeLine(source: []const u8, offset: usize) usize {
+    var line: usize = 1;
+    const end = @min(offset, source.len);
+    for (source[0..end]) |c| {
+        if (c == '\n') line += 1;
+    }
+    return line;
+}
+
 /// The active "register" after evaluating a sub-expression.
 /// .int  → result is in rax  (integer 64-bit)
 /// .float → result is in xmm0 (double-precision)
@@ -24,8 +38,12 @@ pub const AsmGenerator = struct {
     /// Set to true after generating the last top-level expression so the
     /// footer can choose the correct printf format string.
     result_is_float: bool,
+    source: []const u8,
+    map_writer: ?*std.Io.Writer,
+    stmt_counter: u32,
+    map_statements: std.ArrayList(MapEntry),
 
-    pub fn init(writer: *std.Io.Writer, allocator: std.mem.Allocator) !AsmGenerator {
+    pub fn init(writer: *std.Io.Writer, allocator: std.mem.Allocator, source: []const u8, map_writer: ?*std.Io.Writer) !AsmGenerator {
         return .{
             .writer = writer,
             .allocator = allocator,
@@ -34,10 +52,18 @@ pub const AsmGenerator = struct {
             .stack_offset = 0,
             .label_counter = 0,
             .result_is_float = false,
+            .source = source,
+            .map_writer = map_writer,
+            .stmt_counter = 0,
+            .map_statements = .empty,
         };
     }
 
     pub fn deinit(self: *AsmGenerator) void {
+        for (self.map_statements.items) |entry| {
+            self.allocator.free(entry.label);
+        }
+        self.map_statements.deinit(self.allocator);
         self.variables.deinit();
         self.prime_slots.deinit();
     }
@@ -60,6 +86,8 @@ pub const AsmGenerator = struct {
         try self.generateNode(root);
         std.debug.print("[asm] generate: writing footer...\n", .{});
         try self.printFooter();
+        std.debug.print("[asm] generate: writing source map...\n", .{});
+        try self.writeMap();
         std.debug.print("[asm] generate: done\n", .{});
     }
 
@@ -128,6 +156,28 @@ pub const AsmGenerator = struct {
         }
     }
 
+    fn writeMap(self: *AsmGenerator) !void {
+        const mw = self.map_writer orelse return;
+        try mw.print("{{\n  \"statements\": [\n", .{});
+        for (self.map_statements.items, 0..) |entry, i| {
+            if (i > 0) try mw.print(",\n", .{});
+            try mw.print("    {{\"label\": \"{s}\", \"line\": {d}}}", .{ entry.label, entry.line });
+        }
+        try mw.print("\n  ],\n  \"variables\": {{\n", .{});
+        var it = self.variables.iterator();
+        var first = true;
+        while (it.next()) |kv| {
+            if (!first) try mw.print(",\n", .{});
+            first = false;
+            try mw.print("    \"{s}\": {{\"rbp_offset\": {d}, \"kind\": \"{s}\"}}", .{
+                kv.key_ptr.*,
+                kv.value_ptr.offset,
+                @tagName(kv.value_ptr.kind),
+            });
+        }
+        try mw.print("\n  }}\n}}\n", .{});
+    }
+
     /// Returns true when the top-level node will leave its result in xmm0.
     fn isFloatNode(node: *const Node) bool {
         return switch (node.data) {
@@ -179,6 +229,11 @@ pub const AsmGenerator = struct {
                 std.debug.print("[asm]   block: processing {d} statement(s)\n", .{b.statements.len});
                 for (b.statements, 0..) |stmt, i| {
                     std.debug.print("[asm]   block: statement [{d}]\n", .{i});
+                    const line = computeLine(self.source, stmt.span.start);
+                    const label = try std.fmt.allocPrint(self.allocator, "dpl_stmt_{d}", .{self.stmt_counter});
+                    self.stmt_counter += 1;
+                    try self.writer.print("    .globl {s}\n{s}:\n", .{ label, label });
+                    try self.map_statements.append(self.allocator, .{ .label = label, .line = line });
                     try self.generateNode(stmt);
                 }
             },
