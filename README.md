@@ -1,4 +1,4 @@
-# GLP-ZCompiler
+# DPL-Compiler
 
 This is a repo for a new programming language with difference equations as the thinking paradigm. All variable assignments, loops, etc. need to be with this in mind. The current progress is that we have a valid compiler for arithmetic.
 
@@ -29,8 +29,8 @@ This is a repo for a new programming language with difference equations as the t
 Clone the repository:
 
 ```sh
-git clone https://github.com/prajasnaik/glp-zcompiler.git
-cd glp-zcompiler
+git clone https://github.com/prajasnaik/dpl-compiler.git
+cd dpl-compiler
 ```
 
 Build the compiler:
@@ -42,13 +42,13 @@ zig build
 Run the compiler with an input source file and an output path:
 
 ```sh
-./zig-out/bin/glp_zcompiler <input.dpl> -o <path/to/output.s>
+./zig-out/bin/dpl-compiler <input.dpl> -o <path/to/output.s>
 ```
 
 The output directory must already exist. For example, using the provided samples:
 
 ```sh
-./zig-out/bin/glp_zcompiler samples/09_fibonacci.dpl -o outputs/fibonacci.s
+./zig-out/bin/dpl-compiler samples/09_fibonacci.dpl -o outputs/fibonacci.s
 ```
 
 Compile the generated assembly into an executable:
