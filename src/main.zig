@@ -78,6 +78,19 @@ pub fn main() !void {
     var file_writer = out_file.writer(&file_buf);
     const writer = &file_writer.interface;
 
+    // ── Open map file ─────────────────────────────────────────
+    const map_path = if (std.mem.endsWith(u8, out_path, ".s"))
+        try std.fmt.allocPrint(allocator, "{s}.map", .{out_path[0 .. out_path.len - 2]})
+    else
+        try std.fmt.allocPrint(allocator, "{s}.map", .{out_path});
+    defer allocator.free(map_path);
+
+    const map_file = try std.fs.cwd().createFile(map_path, .{});
+    defer map_file.close();
+    var map_buf: [16384]u8 = undefined;
+    var map_file_writer = map_file.writer(&map_buf);
+    const map_writer = &map_file_writer.interface;
+
     // ── Compile ───────────────────────────────────────────────
     std.debug.print("\n===== GLP ZCompiler =====\n", .{});
     std.debug.print("[main] Input:  {s}\n", .{in_path});
@@ -95,12 +108,16 @@ pub fn main() !void {
     }
 
     std.debug.print("[main] Generating assembly...\n", .{});
-    var generator = try AsmGenerator.init(writer, allocator);
+    var generator = try AsmGenerator.init(writer, allocator, input, map_writer);
     defer generator.deinit();
     try generator.generate(ast.root);
 
     writer.flush() catch |err| {
         std.debug.print("[main] ERROR: flush failed: {}\n", .{err});
+        return err;
+    };
+    map_writer.flush() catch |err| {
+        std.debug.print("[main] ERROR: map flush failed: {}\n", .{err});
         return err;
     };
 
