@@ -155,6 +155,16 @@ fn collectPrimeVars(
         // Track primed variables from nested while_loop
         .while_loop => |wl| {
             for (wl.prime_vars) |pv| {
+                // If already primed in this loop body, nested loop cannot prime it.
+                for (list.items) |existing| {
+                    if (std.mem.eql(u8, existing, pv)) {
+                        return error.VariablePrimedInNestedLoop;
+                    }
+                }
+                // If a previous nested loop already primed this variable, reject.
+                if (nested_primed.contains(pv)) {
+                    return error.VariablePrimedInNestedLoop;
+                }
                 try nested_primed.put(pv, {});
             }
         },
