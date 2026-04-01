@@ -117,23 +117,57 @@ fn isRightAssociative(op: TokenType) bool {
 }
 
 /// Walk `node` and collect every unique `prime_assignment` target name into `list`.
-/// Stops descending into nested `while_loop` nodes — they collect their own prime_vars.
-fn collectPrimeVars(node: *Node, list: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
+/// Collects prime variables at the current loop level.
+/// Enforces that:
+/// 1. A variable can only be primed once at this loop level
+/// 2. A variable primed in a nested loop cannot be primed again in this loop
+fn collectPrimeVars(
+    node: *Node,
+    list: *std.ArrayList([]const u8),
+    allocator: std.mem.Allocator,
+    nested_primed: *std.StringHashMap(void),
+) !void {
     switch (node.data) {
         .prime_assignment => |pa| {
+            // Check if already primed at this level
             for (list.items) |existing| {
-                if (std.mem.eql(u8, existing, pa.target)) return; // deduplicate
+                if (std.mem.eql(u8, existing, pa.target)) {
+                    return error.VariableAlreadyPrimed;
+                }
+            }
+            // Check if already primed in a nested loop
+            if (nested_primed.contains(pa.target)) {
+                return error.VariablePrimedInNestedLoop;
             }
             try list.append(allocator, pa.target);
         },
         .block => |b| {
-            for (b.statements) |stmt| try collectPrimeVars(stmt, list, allocator);
+            for (b.statements) |stmt| {
+                try collectPrimeVars(stmt, list, allocator, nested_primed);
+            }
         },
         .if_statement => |s| {
-            try collectPrimeVars(s.then_branch, list, allocator);
-            if (s.else_branch) |eb| try collectPrimeVars(eb, list, allocator);
+            try collectPrimeVars(s.then_branch, list, allocator, nested_primed);
+            if (s.else_branch) |eb| {
+                try collectPrimeVars(eb, list, allocator, nested_primed);
+            }
         },
-        // Nested while_loop: its prime_vars are managed by its own node — do not descend.
+        // Track primed variables from nested while_loop
+        .while_loop => |wl| {
+            for (wl.prime_vars) |pv| {
+                // If already primed in this loop body, nested loop cannot prime it.
+                for (list.items) |existing| {
+                    if (std.mem.eql(u8, existing, pv)) {
+                        return error.VariablePrimedInNestedLoop;
+                    }
+                }
+                // If a previous nested loop already primed this variable, reject.
+                if (nested_primed.contains(pv)) {
+                    return error.VariablePrimedInNestedLoop;
+                }
+                try nested_primed.put(pv, {});
+            }
+        },
         else => {},
     }
 }
@@ -420,7 +454,9 @@ pub const Parser = struct {
             self.loop_depth -= 1;
 
             var prime_var_list: std.ArrayList([]const u8) = .empty;
-            try collectPrimeVars(body, &prime_var_list, self.allocator);
+            var nested_primed = std.StringHashMap(void).init(self.allocator);
+            defer nested_primed.deinit();
+            try collectPrimeVars(body, &prime_var_list, self.allocator, &nested_primed);
             const prime_vars = try prime_var_list.toOwnedSlice(self.allocator);
 
             const node = try self.allocator.create(Node);
