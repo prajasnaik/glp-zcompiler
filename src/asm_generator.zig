@@ -33,6 +33,9 @@ pub const AsmGenerator = struct {
     allocator: std.mem.Allocator,
     variables: std.StringHashMap(VarInfo),
     prime_slots: std.StringHashMap(VarInfo),
+    /// Primed slots to be emitted into the source map for debugger visibility.
+    /// Keys are the base variable names; writeMap emits them as `<name>\``.
+    prime_debug_slots: std.StringHashMap(VarInfo),
     stack_offset: i32,
     label_counter: u32,
     /// Set to true after generating the last top-level expression so the
@@ -49,6 +52,7 @@ pub const AsmGenerator = struct {
             .allocator = allocator,
             .variables = std.StringHashMap(VarInfo).init(allocator),
             .prime_slots = std.StringHashMap(VarInfo).init(allocator),
+            .prime_debug_slots = std.StringHashMap(VarInfo).init(allocator),
             .stack_offset = 0,
             .label_counter = 0,
             .result_is_float = false,
@@ -66,6 +70,7 @@ pub const AsmGenerator = struct {
         self.map_statements.deinit(self.allocator);
         self.variables.deinit();
         self.prime_slots.deinit();
+        self.prime_debug_slots.deinit();
     }
 
     pub fn generate(self: *AsmGenerator, root: *Node) !void {
@@ -170,6 +175,18 @@ pub const AsmGenerator = struct {
             if (!first) try mw.print(",\n", .{});
             first = false;
             try mw.print("    \"{s}\": {{\"rbp_offset\": {d}, \"kind\": \"{s}\"}}", .{
+                kv.key_ptr.*,
+                kv.value_ptr.offset,
+                @tagName(kv.value_ptr.kind),
+            });
+        }
+
+        // Also emit primed slots for debugger reads as `<name>\`` entries.
+        var pit = self.prime_debug_slots.iterator();
+        while (pit.next()) |kv| {
+            if (!first) try mw.print(",\n", .{});
+            first = false;
+            try mw.print("    \"{s}`\": {{\"rbp_offset\": {d}, \"kind\": \"{s}\"}}", .{
                 kv.key_ptr.*,
                 kv.value_ptr.offset,
                 @tagName(kv.value_ptr.kind),
@@ -292,6 +309,7 @@ pub const AsmGenerator = struct {
                     const orig_info = self.variables.get(name) orelse VarInfo{ .offset = 0, .kind = .int };
                     const slot_info = VarInfo{ .offset = self.stack_offset, .kind = orig_info.kind };
                     try self.prime_slots.put(name, slot_info);
+                    try self.prime_debug_slots.put(name, slot_info);
                     std.debug.print("[asm]   while_loop: prime slot for '{s}' at [rbp - {d}] ({s})\n", .{ name, self.stack_offset, @tagName(slot_info.kind) });
                 }
 
