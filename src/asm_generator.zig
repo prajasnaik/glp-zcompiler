@@ -605,6 +605,16 @@ pub const AsmGenerator = struct {
                         }
                         return .int;
                     },
+                    .minus => {
+                        if (kind == .float) {
+                            try self.writer.print("    xorpd xmm1, xmm1\n", .{});
+                            try self.writer.print("    subsd xmm1, xmm0\n", .{});
+                            try self.writer.print("    movapd xmm0, xmm1\n", .{});
+                        } else {
+                            try self.writer.print("    neg rax\n", .{});
+                        }
+                        return kind;
+                    },
                     else => unreachable,
                 }
             },

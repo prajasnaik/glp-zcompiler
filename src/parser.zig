@@ -235,7 +235,11 @@ pub const Parser = struct {
                 const rt = self.inferType(b.right);
                 break :blk if (lt == .float or rt == .float) .float else .int;
             },
-            .unary => .int, // bang produces 0/1
+            .unary => |u| switch (u.op) {
+                .bang => .int, // bang produces 0/1
+                .minus => self.inferType(u.operand),
+                else => .int,
+            },
             .assignment => |a| self.inferType(a.value),
             .prime_assignment => |pa| self.inferType(pa.value),
             .block => .int,
@@ -304,13 +308,14 @@ pub const Parser = struct {
             return node;
         }
 
-        if (token.token_type == .bang) {
-            self.advance(); // consume '!'
+        if (token.token_type == .bang or token.token_type == .minus) {
+            const op = token.token_type;
+            self.advance(); // consume unary operator
             const operand = try self.parseAtom();
             const node = try self.allocator.create(Node);
             node.* = .{
                 .span = .{ .start = token.start, .end = operand.span.end },
-                .data = .{ .unary = .{ .op = .bang, .operand = operand } },
+                .data = .{ .unary = .{ .op = op, .operand = operand } },
             };
             return node;
         }
