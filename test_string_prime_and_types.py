@@ -229,7 +229,7 @@ while (i < 3) {
     i` = i + 1
 }
 csv''',
-                "should_succeed": True,
+                "should_succeed": False,
             },
             {
                 "name": "String repeat with loop",
