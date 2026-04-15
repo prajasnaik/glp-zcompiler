@@ -3,6 +3,7 @@ const std = @import("std");
 pub const TokenType = enum {
     // Literals & Identifiers
     number,
+    string,
     identifier,
 
     // Binary Operators
@@ -26,8 +27,12 @@ pub const TokenType = enum {
     // Grouping
     l_paren,
     r_paren,
+    l_bracket,
+    r_bracket,
     l_brace,
     r_brace,
+    comma,
+    colon,
 
     // Control
     newline,
@@ -117,6 +122,14 @@ pub const Lexer = struct {
                 self.pos += 1;
                 return self.makeToken(.r_paren, start);
             },
+            '[' => {
+                self.pos += 1;
+                return self.makeToken(.l_bracket, start);
+            },
+            ']' => {
+                self.pos += 1;
+                return self.makeToken(.r_bracket, start);
+            },
             '{' => {
                 self.pos += 1;
                 return self.makeToken(.l_brace, start);
@@ -124,6 +137,14 @@ pub const Lexer = struct {
             '}' => {
                 self.pos += 1;
                 return self.makeToken(.r_brace, start);
+            },
+            ',' => {
+                self.pos += 1;
+                return self.makeToken(.comma, start);
+            },
+            ':' => {
+                self.pos += 1;
+                return self.makeToken(.colon, start);
             },
             '<' => {
                 self.pos += 1;
@@ -152,6 +173,34 @@ pub const Lexer = struct {
             '`' => {
                 self.pos += 1;
                 return self.makeToken(.prime, start);
+            },
+            '"' => {
+                const contents_start = self.pos + 1;
+                var i = contents_start;
+                var escaped = false;
+                while (i < self.input.len) : (i += 1) {
+                    const c = self.input[i];
+                    if (escaped) {
+                        escaped = false;
+                        continue;
+                    }
+                    if (c == '\\') {
+                        escaped = true;
+                        continue;
+                    }
+                    if (c == '"') {
+                        self.pos = i + 1;
+                        return .{
+                            .token_type = .string,
+                            .lexeme = self.input[contents_start..i],
+                            .start = start,
+                            .end = self.pos,
+                        };
+                    }
+                    if (c == '\n' or c == '\r') break;
+                }
+                self.pos = i;
+                return self.makeToken(.invalid, start);
             },
             else => {},
         }
