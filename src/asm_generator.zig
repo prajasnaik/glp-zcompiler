@@ -829,6 +829,8 @@ pub const AsmGenerator = struct {
             },
             .binary => |b| {
                 const left_kind = try self.generateExpr(b.left);
+                var left_ptr_off: i32 = 0;
+                var left_len_off: i32 = 0;
 
                 // Push left operand onto stack (always 8 bytes regardless of type).
                 switch (left_kind) {
@@ -837,7 +839,13 @@ pub const AsmGenerator = struct {
                         try self.writer.print("    sub rsp, 8\n", .{});
                         try self.writer.print("    movsd [rsp], xmm0\n", .{});
                     },
-                    .string => {},
+                    .string => {
+                        self.stack_offset += 16;
+                        left_ptr_off = self.stack_offset - 8;
+                        left_len_off = self.stack_offset;
+                        try self.writer.print("    mov [rbp - {d}], rax\n", .{left_ptr_off});
+                        try self.writer.print("    mov [rbp - {d}], rdx\n", .{left_len_off});
+                    },
                 }
 
                 const right_kind = try self.generateExpr(b.right);
@@ -868,32 +876,36 @@ pub const AsmGenerator = struct {
                         return error.UnsupportedStringOperation;
                     }
 
-                    try self.writer.print("    sub rsp, 32\n", .{});
-                    try self.writer.print("    mov [rsp + 16], rax\n", .{});
-                    try self.writer.print("    mov [rsp + 24], rdx\n", .{});
-                    try self.writer.print("    mov [rsp], rax\n", .{});
-                    try self.writer.print("    mov [rsp + 8], rdx\n", .{});
+                    self.stack_offset += 16;
+                    const right_ptr_off = self.stack_offset - 8;
+                    const right_len_off = self.stack_offset;
+                    try self.writer.print("    mov [rbp - {d}], rax\n", .{right_ptr_off});
+                    try self.writer.print("    mov [rbp - {d}], rdx\n", .{right_len_off});
 
-                    try self.writer.print("    mov rdi, [rsp + 24]\n", .{});
-                    try self.writer.print("    add rdi, [rsp + 8]\n", .{});
+                    self.stack_offset += 8;
+                    const dest_ptr_off = self.stack_offset;
+
+                    try self.writer.print("    mov rdi, [rbp - {d}]\n", .{right_len_off});
+                    try self.writer.print("    add rdi, [rbp - {d}]\n", .{left_len_off});
                     try self.writer.print("    add rdi, 1\n", .{});
                     try self.writer.print("    call malloc@PLT\n", .{});
+                    try self.writer.print("    mov [rbp - {d}], rax\n", .{dest_ptr_off});
 
-                    try self.writer.print("    mov rdi, rax\n", .{});
-                    try self.writer.print("    mov rsi, [rsp + 16]\n", .{});
-                    try self.writer.print("    mov rdx, [rsp + 24]\n", .{});
+                    try self.writer.print("    mov rdi, [rbp - {d}]\n", .{dest_ptr_off});
+                    try self.writer.print("    mov rsi, [rbp - {d}]\n", .{left_ptr_off});
+                    try self.writer.print("    mov rdx, [rbp - {d}]\n", .{left_len_off});
                     try self.writer.print("    call memcpy@PLT\n", .{});
 
-                    try self.writer.print("    mov rdi, rax\n", .{});
-                    try self.writer.print("    add rdi, [rsp + 24]\n", .{});
-                    try self.writer.print("    mov rsi, [rsp]\n", .{});
-                    try self.writer.print("    mov rdx, [rsp + 8]\n", .{});
+                    try self.writer.print("    mov rdi, [rbp - {d}]\n", .{dest_ptr_off});
+                    try self.writer.print("    add rdi, [rbp - {d}]\n", .{left_len_off});
+                    try self.writer.print("    mov rsi, [rbp - {d}]\n", .{right_ptr_off});
+                    try self.writer.print("    mov rdx, [rbp - {d}]\n", .{right_len_off});
                     try self.writer.print("    call memcpy@PLT\n", .{});
 
-                    try self.writer.print("    mov rdx, [rsp + 24]\n", .{});
-                    try self.writer.print("    add rdx, [rsp + 8]\n", .{});
+                    try self.writer.print("    mov rax, [rbp - {d}]\n", .{dest_ptr_off});
+                    try self.writer.print("    mov rdx, [rbp - {d}]\n", .{left_len_off});
+                    try self.writer.print("    add rdx, [rbp - {d}]\n", .{right_len_off});
                     try self.writer.print("    mov byte ptr [rax + rdx], 0\n", .{});
-                    try self.writer.print("    add rsp, 32\n", .{});
                     return .string;
                 }
 

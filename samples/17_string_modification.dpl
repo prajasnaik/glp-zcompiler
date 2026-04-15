@@ -1,0 +1,16 @@
+base = "copilot"
+i = 0
+out = ""
+
+while (i < 7) {
+    if (i < 4) {
+        out` = out + base[i:i+1]
+    } else {
+        out` = out + "-"
+    }
+    i` = i + 1
+}
+
+print("modified: {}", out)
+print("find 'cop': {}", find(out, "cop"))
+out
