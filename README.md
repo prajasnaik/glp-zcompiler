@@ -10,7 +10,17 @@ This is a repo for a new programming language with difference equations as the t
 - [x] building conditionals
 - [x] building while loop
 - [x] adding ' operator for difference equation logic
+- [x] string index and splice syntax
+- [x] string find and explicit print formatting
+- [ ] full Python-format feature parity (advanced braces/float formatting)
+- [ ] array syntax and managed list semantics
 - [ ] function support
+- [ ] ownership-transfer semantics for `keep`
+
+## In Progress
+
+- Strings are opaque managed values with pointer+length metadata in the backend.
+- Arrays will reuse the same managed-value direction later, but are not implemented yet.
 
 ## Prerequisites
 
