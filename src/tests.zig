@@ -288,8 +288,7 @@ pub const prime_enforcement_tests = [_]TestCase{
     TestCase{
         .name = "Prime in both if/else branches (conflict with outer)",
         .input = "x = 1\ni = 0\nwhile (i < 5) {\n    if (i < 3) {\n        x` = x + 1\n    } else {\n        x` = x + 2\n    }\n    i` = i + 1\n}",
-        .should_succeed = false,
-        .expected_error = "VariableAlreadyPrimed",
+        .should_succeed = true,
     },
 
     TestCase{
@@ -377,8 +376,7 @@ pub const multiple_prime_tests = [_]TestCase{
     TestCase{
         .name = "Multiple primes to same variable (in different branches)",
         .input = "x = 1\ni = 0\nwhile (i < 2) {\n    if (i < 1) {\n        x` = x + 1\n    } else {\n        x` = x + 2\n    }\n    i` = i + 1\n}",
-        .should_succeed = false,
-        .expected_error = "VariableAlreadyPrimed",
+        .should_succeed = true,
     },
 
     TestCase{

@@ -140,6 +140,15 @@ fn collectPrimeVars(
     allocator: std.mem.Allocator,
     nested_primed: *std.StringHashMap(void),
 ) !void {
+    const Ctx = struct {
+        fn listContains(items: []const []const u8, name: []const u8) bool {
+            for (items) |existing| {
+                if (std.mem.eql(u8, existing, name)) return true;
+            }
+            return false;
+        }
+    };
+
     switch (node.data) {
         .prime_assignment => |pa| {
             // Check if already primed at this level
@@ -160,9 +169,28 @@ fn collectPrimeVars(
             }
         },
         .if_statement => |s| {
-            try collectPrimeVars(s.then_branch, list, allocator, nested_primed);
+            // Treat if/else branches as mutually exclusive at runtime.
+            // So, same primed variable appearing once in each branch is valid.
+            var then_list: std.ArrayList([]const u8) = .empty;
+            defer then_list.deinit(allocator);
+            try collectPrimeVars(s.then_branch, &then_list, allocator, nested_primed);
+
+            for (then_list.items) |name| {
+                if (!Ctx.listContains(list.items, name)) {
+                    try list.append(allocator, name);
+                }
+            }
+
             if (s.else_branch) |eb| {
-                try collectPrimeVars(eb, list, allocator, nested_primed);
+                var else_list: std.ArrayList([]const u8) = .empty;
+                defer else_list.deinit(allocator);
+                try collectPrimeVars(eb, &else_list, allocator, nested_primed);
+
+                for (else_list.items) |name| {
+                    if (!Ctx.listContains(list.items, name)) {
+                        try list.append(allocator, name);
+                    }
+                }
             }
         },
         // Track primed variables from nested while_loop
