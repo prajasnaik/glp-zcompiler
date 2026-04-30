@@ -95,6 +95,76 @@ class DPLCompilerTester:
 
         self._print_results("Nested Loops")
 
+    def test_negative_numbers(self) -> None:
+        """Test unary minus and binary subtraction in one runtime scenario."""
+        code = (
+            "a = 10\n"
+            "b = -3\n"
+            "c = a - b\n"
+            "d = -a + 5\n"
+            "e = 20 - -4\n"
+            "f = c + d + e\n"
+            "f\n"
+        )
+        expected_output = "Result: 32"
+
+        print(f"\n{'='*60}")
+        print("TESTING NEGATIVE NUMBER SCENARIO")
+        print(f"{'='*60}\n")
+
+        try:
+            with open("/tmp/test_negative_numbers.dpl", "w") as f:
+                f.write(code)
+
+            asm_path = "/tmp/test_negative_numbers.s"
+            bin_path = "/tmp/test_negative_numbers"
+
+            compile_result = subprocess.run(
+                [self.compiler_path, "/tmp/test_negative_numbers.dpl", "-o", asm_path],
+                capture_output=True,
+                timeout=5,
+            )
+            if compile_result.returncode != 0:
+                err = compile_result.stderr.decode()
+                print("✗ FAIL: negative_numbers (compile failed)")
+                self.results.append(TestResult("negative_numbers", False, err))
+                return
+
+            link_result = subprocess.run(
+                ["gcc", asm_path, "-o", bin_path, "-lm"],
+                capture_output=True,
+                timeout=5,
+            )
+            if link_result.returncode != 0:
+                err = link_result.stderr.decode()
+                print("✗ FAIL: negative_numbers (link failed)")
+                self.results.append(TestResult("negative_numbers", False, err))
+                return
+
+            run_result = subprocess.run([bin_path], capture_output=True, timeout=5)
+            actual_output = run_result.stdout.decode().strip()
+
+            self._print_expected_vs_actual(expected_output, actual_output)
+
+            if run_result.returncode == 0 and actual_output == expected_output:
+                print("✓ PASS: negative_numbers")
+                self.results.append(TestResult("negative_numbers", True))
+            else:
+                err = run_result.stderr.decode()
+                if not err:
+                    err = f"Expected '{expected_output}', got '{actual_output}'"
+                print("✗ FAIL: negative_numbers")
+                self.results.append(TestResult("negative_numbers", False, err))
+
+        except subprocess.TimeoutExpired:
+            print("✗ FAIL: negative_numbers (timeout)")
+            self.results.append(TestResult("negative_numbers", False, "Timeout"))
+        except Exception as e:
+            print(f"✗ FAIL: negative_numbers ({str(e)})")
+            self.results.append(TestResult("negative_numbers", False, str(e)))
+
+        self._print_results("Negative Numbers")
+
     def _test_sample(self, sample_file: Path) -> None:
         """Test a single sample file."""
         try:
@@ -180,6 +250,11 @@ class DPLCompilerTester:
         print(f"{category}: {passed}/{total} passed ({rate:.1f}%)")
         print(f"{'─'*60}")
 
+    def _print_expected_vs_actual(self, expected: str, actual: str) -> None:
+        """Print expected and actual output for quick debugging."""
+        print(f"Expected output: {expected}")
+        print(f"Actual output:   {actual}")
+
 def main():
     if not Path("zig-out/bin/dpl-compiler").exists():
         print("❌ Compiler not built. Run: zig build")
@@ -191,6 +266,7 @@ def main():
         tester.test_sample_files()
         tester.test_error_cases()
         tester.test_nested_loops()
+        tester.test_negative_numbers()
 
         # Final summary
         total_passed = sum(1 for r in tester.results if r.passed)

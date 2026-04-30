@@ -17,7 +17,10 @@ pub const LiteralValue = union(enum) {
     null_val: void,
 };
 
-pub const NodeData = union(enum) { literal: LiteralValue, variable: []const u8, binary: struct {
+pub const NodeData = union(enum) { literal: LiteralValue, variable: struct {
+    name: []const u8,
+    data_type: DataType,
+}, binary: struct {
     op: TokenType,
     left: *Node,
     right: *Node,
@@ -40,6 +43,16 @@ pub const NodeData = union(enum) { literal: LiteralValue, variable: []const u8, 
 }, prime_assignment: struct {
     target: []const u8,
     value: *Node,
+}, call: struct {
+    name: []const u8,
+    args: []const *Node,
+}, index: struct {
+    target: *Node,
+    index: *Node,
+}, slice: struct {
+    target: *Node,
+    start: ?*Node,
+    end: ?*Node,
 } };
 
 pub const Node = struct {
@@ -127,6 +140,15 @@ fn collectPrimeVars(
     allocator: std.mem.Allocator,
     nested_primed: *std.StringHashMap(void),
 ) !void {
+    const Ctx = struct {
+        fn listContains(items: []const []const u8, name: []const u8) bool {
+            for (items) |existing| {
+                if (std.mem.eql(u8, existing, name)) return true;
+            }
+            return false;
+        }
+    };
+
     switch (node.data) {
         .prime_assignment => |pa| {
             // Check if already primed at this level
@@ -147,9 +169,28 @@ fn collectPrimeVars(
             }
         },
         .if_statement => |s| {
-            try collectPrimeVars(s.then_branch, list, allocator, nested_primed);
+            // Treat if/else branches as mutually exclusive at runtime.
+            // So, same primed variable appearing once in each branch is valid.
+            var then_list: std.ArrayList([]const u8) = .empty;
+            defer then_list.deinit(allocator);
+            try collectPrimeVars(s.then_branch, &then_list, allocator, nested_primed);
+
+            for (then_list.items) |name| {
+                if (!Ctx.listContains(list.items, name)) {
+                    try list.append(allocator, name);
+                }
+            }
+
             if (s.else_branch) |eb| {
-                try collectPrimeVars(eb, list, allocator, nested_primed);
+                var else_list: std.ArrayList([]const u8) = .empty;
+                defer else_list.deinit(allocator);
+                try collectPrimeVars(eb, &else_list, allocator, nested_primed);
+
+                for (else_list.items) |name| {
+                    if (!Ctx.listContains(list.items, name)) {
+                        try list.append(allocator, name);
+                    }
+                }
             }
         },
         // Track primed variables from nested while_loop
@@ -217,17 +258,17 @@ pub const Parser = struct {
                 .null_val => .int,
             },
             .variable => |name| blk: {
-                var i = self.symbols.scopes.items.len;
-                while (i > 0) {
-                    i -= 1;
-                    if (self.symbols.scopes.items[i].get(name)) |t| break :blk t;
-                }
-                break :blk .int;
+                break :blk name.data_type;
             },
             .binary => |b| blk: {
                 // Comparison/logical ops always produce boolean (stored as int 0/1)
                 switch (b.op) {
                     .equal_equal, .not_equal, .lt, .gt, .lt_equal, .gt_equal, .kw_and, .kw_or => break :blk .int,
+                    .plus => {
+                        const lt = self.inferType(b.left);
+                        const rt = self.inferType(b.right);
+                        if (lt == .string or rt == .string) break :blk .string;
+                    },
                     else => {},
                 }
                 // Arithmetic: float if either operand is float
@@ -235,13 +276,109 @@ pub const Parser = struct {
                 const rt = self.inferType(b.right);
                 break :blk if (lt == .float or rt == .float) .float else .int;
             },
-            .unary => .int, // bang produces 0/1
+            .unary => |u| switch (u.op) {
+                .bang => .int, // bang produces 0/1
+                .minus => self.inferType(u.operand),
+                else => .int,
+            },
             .assignment => |a| self.inferType(a.value),
             .prime_assignment => |pa| self.inferType(pa.value),
+            .call => |c| {
+                if (std.mem.eql(u8, c.name, "find")) return .int;
+                if (std.mem.eql(u8, c.name, "print")) return .int;
+                return .int;
+            },
+            .index => .string,
+            .slice => .string,
             .block => .int,
             .if_statement => .int,
             .while_loop => .int,
         };
+    }
+
+    fn parseCall(self: *Parser, ident_token: Token) anyerror!*Node {
+        const call_start = ident_token.start;
+        self.advance(); // consume identifier
+        self.advance(); // consume '('
+
+        var args: std.ArrayList(*Node) = .empty;
+        if (self.current.token_type != .r_paren) {
+            while (true) {
+                const arg = try self.parseExpression(0);
+                try args.append(self.allocator, arg);
+                if (self.current.token_type == .comma) {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+        }
+
+        if (self.current.token_type != .r_paren) {
+            self.error_token = self.current;
+            return error.UnmatchedParenthesis;
+        }
+        const end_pos = self.current.end;
+        self.advance(); // consume ')'
+
+        const node = try self.allocator.create(Node);
+        node.* = .{
+            .span = .{ .start = call_start, .end = end_pos },
+            .data = .{ .call = .{ .name = ident_token.lexeme, .args = try args.toOwnedSlice(self.allocator) } },
+        };
+        return node;
+    }
+
+    fn parsePostfix(self: *Parser, base_node: *Node) anyerror!*Node {
+        var node = base_node;
+
+        while (self.current.token_type == .l_bracket) {
+            const bracket_start = self.current.start;
+            self.advance(); // consume '['
+
+            var start_expr: ?*Node = null;
+            var end_expr: ?*Node = null;
+            var is_slice = false;
+
+            if (self.current.token_type != .colon and self.current.token_type != .r_bracket) {
+                start_expr = try self.parseExpression(0);
+            }
+
+            if (self.current.token_type == .colon) {
+                is_slice = true;
+                self.advance(); // consume ':'
+                if (self.current.token_type != .r_bracket) {
+                    end_expr = try self.parseExpression(0);
+                }
+            }
+
+            if (self.current.token_type != .r_bracket) {
+                self.error_token = self.current;
+                return error.ExpectedClosingBracket;
+            }
+            const end_pos = self.current.end;
+            self.advance(); // consume ']'
+
+            const next_node = try self.allocator.create(Node);
+            if (is_slice) {
+                next_node.* = .{
+                    .span = .{ .start = bracket_start, .end = end_pos },
+                    .data = .{ .slice = .{ .target = node, .start = start_expr, .end = end_expr } },
+                };
+            } else {
+                if (start_expr == null) {
+                    self.error_token = self.current;
+                    return error.ExpectedIndexExpression;
+                }
+                next_node.* = .{
+                    .span = .{ .start = bracket_start, .end = end_pos },
+                    .data = .{ .index = .{ .target = node, .index = start_expr.? } },
+                };
+            }
+            node = next_node;
+        }
+
+        return node;
     }
 
     fn parseAtom(self: *Parser) anyerror!*Node {
@@ -260,22 +397,47 @@ pub const Parser = struct {
             expr.span.end = self.current.end;
 
             self.advance(); // consume ')'
-            return expr;
+            return self.parsePostfix(expr);
         }
 
         if (token.token_type == .identifier) {
+            if (self.peek_token.token_type == .l_paren) {
+                const call_node = try self.parseCall(token);
+                return self.parsePostfix(call_node);
+            }
+
             if (!self.symbols.isDefined(token.lexeme)) {
                 self.error_token = token;
                 return error.UndefinedVariable;
             }
 
+            var i = self.symbols.scopes.items.len;
+            var data_type: DataType = .int;
+            while (i > 0) {
+                i -= 1;
+                if (self.symbols.scopes.items[i].get(token.lexeme)) |t| {
+                    data_type = t;
+                    break;
+                }
+            }
+
             const node = try self.allocator.create(Node);
             node.* = .{
                 .span = .{ .start = token.start, .end = token.end },
-                .data = .{ .variable = token.lexeme },
+                .data = .{ .variable = .{ .name = token.lexeme, .data_type = data_type } },
             };
             self.advance();
-            return node;
+            return self.parsePostfix(node);
+        }
+
+        if (token.token_type == .string) {
+            const node = try self.allocator.create(Node);
+            node.* = .{
+                .span = .{ .start = token.start, .end = token.end },
+                .data = .{ .literal = .{ .string = token.lexeme } },
+            };
+            self.advance();
+            return self.parsePostfix(node);
         }
 
         if (token.token_type == .number) {
@@ -291,7 +453,7 @@ pub const Parser = struct {
                 .data = .{ .literal = lit },
             };
             self.advance();
-            return node;
+            return self.parsePostfix(node);
         }
 
         if (token.token_type == .kw_true or token.token_type == .kw_false) {
@@ -301,16 +463,17 @@ pub const Parser = struct {
                 .data = .{ .literal = .{ .boolean = token.token_type == .kw_true } },
             };
             self.advance();
-            return node;
+            return self.parsePostfix(node);
         }
 
-        if (token.token_type == .bang) {
-            self.advance(); // consume '!'
+        if (token.token_type == .bang or token.token_type == .minus) {
+            const op = token.token_type;
+            self.advance(); // consume unary operator
             const operand = try self.parseAtom();
             const node = try self.allocator.create(Node);
             node.* = .{
                 .span = .{ .start = token.start, .end = operand.span.end },
-                .data = .{ .unary = .{ .op = .bang, .operand = operand } },
+                .data = .{ .unary = .{ .op = op, .operand = operand } },
             };
             return node;
         }
@@ -324,7 +487,7 @@ pub const Parser = struct {
 
         while (true) {
             const op_type = self.current.token_type;
-            if (op_type == .newline or op_type == .r_paren or op_type == .r_brace or op_type == .eof) break;
+            if (op_type == .newline or op_type == .r_paren or op_type == .r_brace or op_type == .r_bracket or op_type == .comma or op_type == .colon or op_type == .eof) break;
 
             const power = getBindingPower(op_type);
             if (power == 0 or power < minPower) break;

@@ -50,6 +50,18 @@ pub const successful_tests = [_]TestCase{
     },
 
     TestCase{
+        .name = "05_strings: String literals and concat",
+        .input = "greeting = \"hello\"\nname = \"world\"\nmessage = greeting + \" \" + name\nmessage",
+        .should_succeed = true,
+    },
+
+    TestCase{
+        .name = "05_strings_ops: index slice find print",
+        .input = "s = \"hello world\"\nprint(\"msg: {}\", s)\nprint(\"idx: {}\", s[1])\nprint(\"slice: {}\", s[0:5])\nprint(\"found: {}\", find(s, \"world\"))\nout = s[6:]\nout",
+        .should_succeed = true,
+    },
+
+    TestCase{
         .name = "06_if_else: If-else statement",
         .input = "x = 5\nif (x > 3) {\n    y = 10\n} else {\n    y = 20\n}",
         .should_succeed = true,
@@ -276,8 +288,7 @@ pub const prime_enforcement_tests = [_]TestCase{
     TestCase{
         .name = "Prime in both if/else branches (conflict with outer)",
         .input = "x = 1\ni = 0\nwhile (i < 5) {\n    if (i < 3) {\n        x` = x + 1\n    } else {\n        x` = x + 2\n    }\n    i` = i + 1\n}",
-        .should_succeed = false,
-        .expected_error = "VariableAlreadyPrimed",
+        .should_succeed = true,
     },
 
     TestCase{
@@ -365,8 +376,7 @@ pub const multiple_prime_tests = [_]TestCase{
     TestCase{
         .name = "Multiple primes to same variable (in different branches)",
         .input = "x = 1\ni = 0\nwhile (i < 2) {\n    if (i < 1) {\n        x` = x + 1\n    } else {\n        x` = x + 2\n    }\n    i` = i + 1\n}",
-        .should_succeed = false,
-        .expected_error = "VariableAlreadyPrimed",
+        .should_succeed = true,
     },
 
     TestCase{

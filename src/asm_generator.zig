@@ -18,9 +18,10 @@ fn computeLine(source: []const u8, offset: usize) usize {
 }
 
 /// The active "register" after evaluating a sub-expression.
-/// .int  → result is in rax  (integer 64-bit)
-/// .float → result is in xmm0 (double-precision)
-pub const RegKind = enum { int, float };
+/// .int    → result is in rax  (integer 64-bit)
+/// .float  → result is in xmm0 (double-precision)
+/// .string → result is in rax (pointer) and rdx (length)
+pub const RegKind = enum { int, float, string };
 
 /// Tracks where a variable lives on the stack and whether it holds a float or int.
 const VarInfo = struct {
@@ -38,9 +39,9 @@ pub const AsmGenerator = struct {
     prime_debug_slots: std.StringHashMap(VarInfo),
     stack_offset: i32,
     label_counter: u32,
-    /// Set to true after generating the last top-level expression so the
-    /// footer can choose the correct printf format string.
-    result_is_float: bool,
+    /// Set after generating the last top-level expression so the footer can
+    /// choose the correct printf format string.
+    result_kind: RegKind,
     source: []const u8,
     map_writer: ?*std.Io.Writer,
     stmt_counter: u32,
@@ -55,7 +56,7 @@ pub const AsmGenerator = struct {
             .prime_debug_slots = std.StringHashMap(VarInfo).init(allocator),
             .stack_offset = 0,
             .label_counter = 0,
-            .result_is_float = false,
+            .result_kind = .int,
             .source = source,
             .map_writer = map_writer,
             .stmt_counter = 0,
@@ -75,17 +76,17 @@ pub const AsmGenerator = struct {
 
     pub fn generate(self: *AsmGenerator, root: *Node) !void {
         std.debug.print("[asm] generate: starting with root type={s}\n", .{@tagName(root.data)});
-        // First pass: figure out whether the last expression produces a float.
-        // We set result_is_float before writing the header so the rodata section
-        // can include the right format string.
+        // First pass: figure out whether the last expression produces a float
+        // or string. We set result_kind before writing the header so the rodata
+        // section can include the right format string.
         if (root.data == .block) {
             const stmts = root.data.block.statements;
             if (stmts.len > 0) {
                 const last = stmts[stmts.len - 1];
-                self.result_is_float = isFloatNode(last);
+                self.result_kind = resultKindOfNode(last);
             }
         }
-        std.debug.print("[asm] generate: writing header (result_is_float={})...\n", .{self.result_is_float});
+        std.debug.print("[asm] generate: writing header (result_kind={s})...\n", .{@tagName(self.result_kind)});
         try self.printHeader();
         std.debug.print("[asm] generate: writing body...\n", .{});
         try self.generateNode(root);
@@ -98,8 +99,13 @@ pub const AsmGenerator = struct {
 
     fn printHeader(self: *AsmGenerator) !void {
         // Choose the format string based on result type.
-        if (self.result_is_float) {
+        if (self.result_kind == .float) {
             try self.writer.print(
+                \\    .extern printf
+                \\    .extern malloc
+                \\    .extern memcpy
+                \\    .extern strstr
+                \\
                 \\    .intel_syntax noprefix
                 \\    .section .rodata
                 \\fmt:
@@ -114,8 +120,34 @@ pub const AsmGenerator = struct {
                 \\    sub rsp, 512
                 \\
             , .{});
+        } else if (self.result_kind == .string) {
+            try self.writer.print(
+                \\    .extern printf
+                \\    .extern malloc
+                \\    .extern memcpy
+                \\    .extern strstr
+                \\
+                \\    .intel_syntax noprefix
+                \\    .section .rodata
+                \\fmt:
+                \\    .string "Result: %.*s\n"
+                \\
+                \\    .section .text
+                \\    .globl main
+                \\
+                \\main:
+                \\    push rbp
+                \\    mov rbp, rsp
+                \\    sub rsp, 512
+                \\
+            , .{});
         } else {
             try self.writer.print(
+                \\    .extern printf
+                \\    .extern malloc
+                \\    .extern memcpy
+                \\    .extern strstr
+                \\
                 \\    .intel_syntax noprefix
                 \\    .section .rodata
                 \\fmt:
@@ -134,11 +166,24 @@ pub const AsmGenerator = struct {
     }
 
     fn printFooter(self: *AsmGenerator) !void {
-        if (self.result_is_float) {
+        if (self.result_kind == .float) {
             // For printf with %f, the double must be passed in xmm0 and eax=1.
             try self.writer.print(
                 \\    lea rdi, [rip + fmt]    # First arg: format string
                 \\    mov eax, 1              # 1 XMM register used for varargs
+                \\    call printf@PLT
+                \\
+                \\    xor eax, eax            # Return 0
+                \\    leave
+                \\    ret
+                \\
+            , .{});
+        } else if (self.result_kind == .string) {
+            try self.writer.print(
+                \\    lea rdi, [rip + fmt]    # First arg: format string
+                \\    mov esi, edx            # Second arg: string length
+                \\    mov rdx, rax            # Third arg: string pointer
+                \\    xor eax, eax            # printf expects 0 in EAX for varargs
                 \\    call printf@PLT
                 \\
                 \\    xor eax, eax            # Return 0
@@ -195,27 +240,106 @@ pub const AsmGenerator = struct {
         try mw.print("\n  }}\n}}\n", .{});
     }
 
-    /// Returns true when the top-level node will leave its result in xmm0.
-    fn isFloatNode(node: *const Node) bool {
+    fn emitByteList(self: *AsmGenerator, bytes: []const u8) !void {
+        try self.writer.print("    .byte ", .{});
+        var i: usize = 0;
+        var first = true;
+        while (i < bytes.len) : (i += 1) {
+            var value = bytes[i];
+            if (value == '\\' and i + 1 < bytes.len) {
+                i += 1;
+                value = switch (bytes[i]) {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '\\' => '\\',
+                    '"' => '"',
+                    else => bytes[i],
+                };
+            }
+            if (!first) try self.writer.print(", ", .{});
+            first = false;
+            try self.writer.print("{d}", .{value});
+        }
+        try self.writer.print("\n", .{});
+    }
+
+    fn buildPrintfFormat(self: *AsmGenerator, fmt_src: []const u8, arg_kinds: []const RegKind) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        var arg_index: usize = 0;
+        var i: usize = 0;
+
+        while (i < fmt_src.len) : (i += 1) {
+            if (fmt_src[i] == '{' and i + 1 < fmt_src.len and fmt_src[i + 1] == '}') {
+                if (arg_index >= arg_kinds.len) return error.PrintPlaceholderMismatch;
+                switch (arg_kinds[arg_index]) {
+                    .int => try out.appendSlice(self.allocator, "%ld"),
+                    .string => try out.appendSlice(self.allocator, "%.*s"),
+                    .float => return error.UnsupportedPrintFloatFormat,
+                }
+                arg_index += 1;
+                i += 1;
+                continue;
+            }
+            try out.append(self.allocator, fmt_src[i]);
+        }
+
+        if (arg_index != arg_kinds.len) return error.PrintPlaceholderMismatch;
+        if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') {
+            try out.append(self.allocator, '\n');
+        }
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    fn resultKindOfNode(node: *const Node) RegKind {
         return switch (node.data) {
             .literal => |lit| switch (lit) {
-                .float => true,
-                else => false,
+                .float => .float,
+                .string => .string,
+                else => .int,
             },
-            .variable => false, // conservative; runtime type known via VarInfo
+            .variable => |v| switch (v.data_type) {
+                .float => .float,
+                .string => .string,
+                else => .int,
+            },
             .binary => |b| switch (b.op) {
                 // Comparison / logical → always int (0/1)
-                .equal_equal, .not_equal, .lt, .gt, .lt_equal, .gt_equal, .kw_and, .kw_or => false,
-                else => isFloatNode(b.left) or isFloatNode(b.right),
+                .equal_equal, .not_equal, .lt, .gt, .lt_equal, .gt_equal, .kw_and, .kw_or => .int,
+                .plus => blk: {
+                    const left_kind = resultKindOfNode(b.left);
+                    const right_kind = resultKindOfNode(b.right);
+                    if (left_kind == .string or right_kind == .string) break :blk .string;
+                    if (left_kind == .float or right_kind == .float) break :blk .float;
+                    break :blk .int;
+                },
+                else => blk: {
+                    const left_kind = resultKindOfNode(b.left);
+                    const right_kind = resultKindOfNode(b.right);
+                    if (left_kind == .string or right_kind == .string) break :blk .string;
+                    if (left_kind == .float or right_kind == .float) break :blk .float;
+                    break :blk .int;
+                },
             },
-            .unary => false,
-            .assignment => |a| isFloatNode(a.value),
-            .prime_assignment => |pa| isFloatNode(pa.value),
+            .unary => |u| switch (u.op) {
+                .bang => .int,
+                .minus => resultKindOfNode(u.operand),
+                else => .int,
+            },
+            .assignment => |a| resultKindOfNode(a.value),
+            .prime_assignment => |pa| resultKindOfNode(pa.value),
+            .call => |c| {
+                if (std.mem.eql(u8, c.name, "find")) return .int;
+                if (std.mem.eql(u8, c.name, "print")) return .int;
+                return .int;
+            },
+            .index => .string,
+            .slice => .string,
             .block => |bl| blk: {
-                if (bl.statements.len == 0) break :blk false;
-                break :blk isFloatNode(bl.statements[bl.statements.len - 1]);
+                if (bl.statements.len == 0) break :blk .int;
+                break :blk resultKindOfNode(bl.statements[bl.statements.len - 1]);
             },
-            else => false,
+            else => .int,
         };
     }
 
@@ -224,17 +348,21 @@ pub const AsmGenerator = struct {
 
         switch (node.data) {
             .assignment => |a| std.debug.print(" target='{s}'", .{a.target}),
-            .variable => |v| std.debug.print(" name='{s}'", .{v}),
+            .variable => |v| std.debug.print(" name='{s}' type={s}", .{ v.name, @tagName(v.data_type) }),
             .literal => |l| {
                 switch (l) {
                     .int => |n| std.debug.print(" value(int)={d}", .{n}),
                     .float => |n| std.debug.print(" value(float)={d}", .{n}),
+                    .string => |s| std.debug.print(" value(string_len)={d}", .{s.len}),
                     else => std.debug.print(" value=unsupported_literal", .{}),
                 }
             },
             .binary => |b| std.debug.print(" op='{s}'", .{@tagName(b.op)}),
             .block => |b| std.debug.print(" stmts={d}", .{b.statements.len}),
             .unary => |u| std.debug.print(" op='{s}'", .{@tagName(u.op)}),
+            .call => |c| std.debug.print(" call='{s}' argc={d}", .{ c.name, c.args.len }),
+            .index => std.debug.print(" (index)", .{}),
+            .slice => std.debug.print(" (slice)", .{}),
             .if_statement => std.debug.print(" (if statement)", .{}),
             .while_loop => |wl| std.debug.print(" prime_vars={d}", .{wl.prime_vars.len}),
             .prime_assignment => |pa| std.debug.print(" target='{s}'", .{pa.target}),
@@ -257,25 +385,34 @@ pub const AsmGenerator = struct {
             .assignment => |a| {
                 std.debug.print("[asm]   assignment: evaluating RHS for '{s}'\n", .{a.target});
                 const kind = try self.generateExpr(a.value);
-                self.stack_offset += 8;
-                const info = VarInfo{ .offset = self.stack_offset, .kind = kind };
+                self.stack_offset += if (kind == .string) 16 else 8;
+                const info_offset: i32 = if (kind == .string) self.stack_offset - 8 else self.stack_offset;
+                const info = VarInfo{ .offset = info_offset, .kind = kind };
                 try self.variables.put(a.target, info);
-                std.debug.print("[asm]   assignment: '{s}' stored at [rbp - {d}] ({s})\n", .{ a.target, self.stack_offset, @tagName(kind) });
+                std.debug.print("[asm]   assignment: '{s}' stored at [rbp - {d}] ({s})\n", .{ a.target, info.offset, @tagName(kind) });
                 switch (kind) {
-                    .int => try self.writer.print("    mov [rbp - {d}], rax\n", .{self.stack_offset}),
-                    .float => try self.writer.print("    movsd [rbp - {d}], xmm0\n", .{self.stack_offset}),
+                    .int => try self.writer.print("    mov [rbp - {d}], rax\n", .{info.offset}),
+                    .float => try self.writer.print("    movsd [rbp - {d}], xmm0\n", .{info.offset}),
+                    .string => {
+                        try self.writer.print("    mov [rbp - {d}], rax\n", .{info.offset});
+                        try self.writer.print("    mov [rbp - {d}], rdx\n", .{info.offset + 8});
+                    },
                 }
             },
             .variable => |name| {
-                const info = self.variables.get(name).?;
-                std.debug.print("[asm]   variable: '{s}' loaded from [rbp - {d}] ({s})\n", .{ name, info.offset, @tagName(info.kind) });
+                const info = self.variables.get(name.name).?;
+                std.debug.print("[asm]   variable: '{s}' loaded from [rbp - {d}] ({s})\n", .{ name.name, info.offset, @tagName(info.kind) });
                 switch (info.kind) {
                     .int => try self.writer.print("    mov rax, [rbp - {d}]\n", .{info.offset}),
                     .float => try self.writer.print("    movsd xmm0, [rbp - {d}]\n", .{info.offset}),
+                    .string => {
+                        try self.writer.print("    mov rax, [rbp - {d}]\n", .{info.offset});
+                        try self.writer.print("    mov rdx, [rbp - {d}]\n", .{info.offset + 8});
+                    },
                 }
             },
             // Expressions: delegate to generateExpr (result discarded)
-            .binary, .literal, .unary => {
+            .binary, .literal, .unary, .call, .index, .slice => {
                 _ = try self.generateExpr(node);
             },
             .if_statement => |if_stmt| {
@@ -305,12 +442,13 @@ pub const AsmGenerator = struct {
 
                 // Allocate prime slots.  Infer kind from the corresponding variable.
                 for (wl.prime_vars) |name| {
-                    self.stack_offset += 8;
                     const orig_info = self.variables.get(name) orelse VarInfo{ .offset = 0, .kind = .int };
-                    const slot_info = VarInfo{ .offset = self.stack_offset, .kind = orig_info.kind };
+                    self.stack_offset += if (orig_info.kind == .string) 16 else 8;
+                    const slot_offset: i32 = if (orig_info.kind == .string) self.stack_offset - 8 else self.stack_offset;
+                    const slot_info = VarInfo{ .offset = slot_offset, .kind = orig_info.kind };
                     try self.prime_slots.put(name, slot_info);
                     try self.prime_debug_slots.put(name, slot_info);
-                    std.debug.print("[asm]   while_loop: prime slot for '{s}' at [rbp - {d}] ({s})\n", .{ name, self.stack_offset, @tagName(slot_info.kind) });
+                    std.debug.print("[asm]   while_loop: prime slot for '{s}' at [rbp - {d}] ({s})\n", .{ name, slot_info.offset, @tagName(slot_info.kind) });
                 }
 
                 try self.writer.print(".Lloop_start_{d}:\n", .{label_id});
@@ -335,6 +473,12 @@ pub const AsmGenerator = struct {
                             try self.writer.print("    movsd xmm0, [rbp - {d}]\n", .{new_info.offset});
                             try self.writer.print("    movsd [rbp - {d}], xmm0\n", .{old_info.offset});
                         },
+                        .string => {
+                            try self.writer.print("    mov rax, [rbp - {d}]\n", .{new_info.offset});
+                            try self.writer.print("    mov rdx, [rbp - {d}]\n", .{new_info.offset + 8});
+                            try self.writer.print("    mov [rbp - {d}], rax\n", .{old_info.offset});
+                            try self.writer.print("    mov [rbp - {d}], rdx\n", .{old_info.offset + 8});
+                        },
                     }
                 }
 
@@ -353,6 +497,10 @@ pub const AsmGenerator = struct {
                 switch (kind) {
                     .int => try self.writer.print("    mov [rbp - {d}], rax\n", .{new_info.offset}),
                     .float => try self.writer.print("    movsd [rbp - {d}], xmm0\n", .{new_info.offset}),
+                    .string => {
+                        try self.writer.print("    mov [rbp - {d}], rax\n", .{new_info.offset});
+                        try self.writer.print("    mov [rbp - {d}], rdx\n", .{new_info.offset + 8});
+                    },
                 }
             },
         }
@@ -376,6 +524,25 @@ pub const AsmGenerator = struct {
                         try self.writer.print("    movq xmm0, rax\n", .{});
                         return .float;
                     },
+                    .string => |val| {
+                        var label_buf: [32]u8 = undefined;
+                        const label = try std.fmt.bufPrint(&label_buf, ".Lstr_{d}", .{self.label_counter});
+                        self.label_counter += 1;
+
+                        try self.writer.print("    .section .rodata\n{s}:\n", .{label});
+                        try self.emitByteList(val);
+                        try self.writer.print("    .byte 0\n", .{});
+                        try self.writer.print("    .text\n", .{});
+
+                        try self.writer.print("    mov rdi, {d}\n", .{val.len + 1});
+                        try self.writer.print("    call malloc@PLT\n", .{});
+                        try self.writer.print("    mov rdi, rax\n", .{});
+                        try self.writer.print("    lea rsi, [rip + {s}]\n", .{label});
+                        try self.writer.print("    mov rdx, {d}\n", .{val.len + 1});
+                        try self.writer.print("    call memcpy@PLT\n", .{});
+                        try self.writer.print("    mov rdx, {d}\n", .{val.len});
+                        return .string;
+                    },
                     .boolean => |val| {
                         try self.writer.print("    mov rax, {d}\n", .{@as(i64, if (val) 1 else 0)});
                         return .int;
@@ -387,7 +554,7 @@ pub const AsmGenerator = struct {
                 }
             },
             .variable => |name| {
-                const info = self.variables.get(name).?;
+                const info = self.variables.get(name.name).?;
                 switch (info.kind) {
                     .int => {
                         try self.writer.print("    mov rax, [rbp - {d}]\n", .{info.offset});
@@ -397,10 +564,273 @@ pub const AsmGenerator = struct {
                         try self.writer.print("    movsd xmm0, [rbp - {d}]\n", .{info.offset});
                         return .float;
                     },
+                    .string => {
+                        try self.writer.print("    mov rax, [rbp - {d}]\n", .{info.offset});
+                        try self.writer.print("    mov rdx, [rbp - {d}]\n", .{info.offset + 8});
+                        return .string;
+                    },
                 }
+            },
+            .call => |c| {
+                if (std.mem.eql(u8, c.name, "find")) {
+                    if (c.args.len != 2) return error.FindArityMismatch;
+
+                    const hay_kind = try self.generateExpr(c.args[0]);
+                    if (hay_kind != .string) return error.FindRequiresStrings;
+                    self.stack_offset += 16;
+                    const hay_ptr_off = self.stack_offset - 8;
+                    const hay_len_off = self.stack_offset;
+                    try self.writer.print("    mov [rbp - {d}], rax\n", .{hay_ptr_off});
+                    try self.writer.print("    mov [rbp - {d}], rdx\n", .{hay_len_off});
+
+                    const needle_kind = try self.generateExpr(c.args[1]);
+                    if (needle_kind != .string) return error.FindRequiresStrings;
+                    self.stack_offset += 16;
+                    const needle_ptr_off = self.stack_offset - 8;
+                    try self.writer.print("    mov [rbp - {d}], rax\n", .{needle_ptr_off});
+
+                    const label_id = self.label_counter;
+                    self.label_counter += 1;
+
+                    try self.writer.print("    mov rdi, [rbp - {d}]\n", .{hay_ptr_off});
+                    try self.writer.print("    mov rsi, [rbp - {d}]\n", .{needle_ptr_off});
+                    try self.writer.print("    call strstr@PLT\n", .{});
+                    try self.writer.print("    cmp rax, 0\n", .{});
+                    try self.writer.print("    je .Lfind_not_{d}\n", .{label_id});
+                    try self.writer.print("    sub rax, [rbp - {d}]\n", .{hay_ptr_off});
+                    try self.writer.print("    jmp .Lfind_end_{d}\n", .{label_id});
+                    try self.writer.print(".Lfind_not_{d}:\n", .{label_id});
+                    try self.writer.print("    mov rax, -1\n", .{});
+                    try self.writer.print(".Lfind_end_{d}:\n", .{label_id});
+                    return .int;
+                }
+
+                if (std.mem.eql(u8, c.name, "print")) {
+                    if (c.args.len == 0) return error.PrintArityMismatch;
+
+                    const fmt_node = c.args[0];
+                    const fmt_src = switch (fmt_node.data) {
+                        .literal => |lit| switch (lit) {
+                            .string => |s| s,
+                            else => return error.PrintFormatMustBeStringLiteral,
+                        },
+                        else => return error.PrintFormatMustBeStringLiteral,
+                    };
+
+                    var arg_kinds: std.ArrayList(RegKind) = .empty;
+                    defer arg_kinds.deinit(self.allocator);
+                    for (c.args[1..]) |arg| {
+                        try arg_kinds.append(self.allocator, resultKindOfNode(arg));
+                    }
+
+                    const final_fmt = try self.buildPrintfFormat(fmt_src, arg_kinds.items);
+                    defer self.allocator.free(final_fmt);
+
+                    var fmt_label_buf: [40]u8 = undefined;
+                    const fmt_label = try std.fmt.bufPrint(&fmt_label_buf, ".Lprint_fmt_{d}", .{self.label_counter});
+                    self.label_counter += 1;
+
+                    try self.writer.print("    .section .rodata\n{s}:\n", .{fmt_label});
+                    try self.emitByteList(final_fmt);
+                    try self.writer.print("    .byte 0\n", .{});
+                    try self.writer.print("    .text\n", .{});
+
+                    var flat_offsets: std.ArrayList(i32) = .empty;
+                    defer flat_offsets.deinit(self.allocator);
+
+                    for (c.args[1..], arg_kinds.items) |arg, kind| {
+                        const actual_kind = try self.generateExpr(arg);
+                        if (actual_kind != kind) return error.PrintArgumentTypeMismatch;
+                        switch (kind) {
+                            .int => {
+                                self.stack_offset += 8;
+                                const off = self.stack_offset;
+                                try self.writer.print("    mov [rbp - {d}], rax\n", .{off});
+                                try flat_offsets.append(self.allocator, off);
+                            },
+                            .string => {
+                                self.stack_offset += 16;
+                                const ptr_off = self.stack_offset - 8;
+                                const len_off = self.stack_offset;
+                                try self.writer.print("    mov [rbp - {d}], rax\n", .{ptr_off});
+                                try self.writer.print("    mov [rbp - {d}], rdx\n", .{len_off});
+                                // printf for %.*s expects: precision then pointer
+                                try flat_offsets.append(self.allocator, len_off);
+                                try flat_offsets.append(self.allocator, ptr_off);
+                            },
+                            .float => return error.UnsupportedPrintFloatFormat,
+                        }
+                    }
+
+                    const arg_regs = [_][]const u8{ "rsi", "rdx", "rcx", "r8", "r9" };
+                    if (flat_offsets.items.len > arg_regs.len) return error.TooManyPrintArguments;
+
+                    try self.writer.print("    lea rdi, [rip + {s}]\n", .{fmt_label});
+                    for (flat_offsets.items, 0..) |off, idx| {
+                        try self.writer.print("    mov {s}, [rbp - {d}]\n", .{ arg_regs[idx], off });
+                    }
+                    try self.writer.print("    xor eax, eax\n", .{});
+                    try self.writer.print("    call printf@PLT\n", .{});
+                    try self.writer.print("    mov rax, 0\n", .{});
+                    return .int;
+                }
+
+                return error.UnknownFunction;
+            },
+            .index => |idx| {
+                const target_kind = try self.generateExpr(idx.target);
+                if (target_kind != .string) return error.IndexRequiresString;
+                self.stack_offset += 16;
+                const ptr_off = self.stack_offset - 8;
+                const len_off = self.stack_offset;
+                try self.writer.print("    mov [rbp - {d}], rax\n", .{ptr_off});
+                try self.writer.print("    mov [rbp - {d}], rdx\n", .{len_off});
+
+                const idx_kind = try self.generateExpr(idx.index);
+                if (idx_kind != .int) return error.IndexMustBeInteger;
+
+                const label_id = self.label_counter;
+                self.label_counter += 1;
+
+                try self.writer.print("    mov rcx, rax\n", .{});
+                try self.writer.print("    cmp rcx, 0\n", .{});
+                try self.writer.print("    jge .Lidx_nonneg_{d}\n", .{label_id});
+                try self.writer.print("    add rcx, [rbp - {d}]\n", .{len_off});
+                try self.writer.print(".Lidx_nonneg_{d}:\n", .{label_id});
+                try self.writer.print("    cmp rcx, 0\n", .{});
+                try self.writer.print("    jl .Lidx_oob_{d}\n", .{label_id});
+                try self.writer.print("    cmp rcx, [rbp - {d}]\n", .{len_off});
+                try self.writer.print("    jge .Lidx_oob_{d}\n", .{label_id});
+
+                self.stack_offset += 8;
+                const idx_off = self.stack_offset;
+                try self.writer.print("    mov [rbp - {d}], rcx\n", .{idx_off});
+
+                try self.writer.print("    mov rdi, 2\n", .{});
+                try self.writer.print("    call malloc@PLT\n", .{});
+                try self.writer.print("    mov rsi, [rbp - {d}]\n", .{ptr_off});
+                try self.writer.print("    add rsi, [rbp - {d}]\n", .{idx_off});
+                try self.writer.print("    mov bl, [rsi]\n", .{});
+                try self.writer.print("    mov [rax], bl\n", .{});
+                try self.writer.print("    mov byte ptr [rax + 1], 0\n", .{});
+                try self.writer.print("    mov rdx, 1\n", .{});
+                try self.writer.print("    jmp .Lidx_end_{d}\n", .{label_id});
+
+                try self.writer.print(".Lidx_oob_{d}:\n", .{label_id});
+                try self.writer.print("    mov rdi, 1\n", .{});
+                try self.writer.print("    call malloc@PLT\n", .{});
+                try self.writer.print("    mov byte ptr [rax], 0\n", .{});
+                try self.writer.print("    mov rdx, 0\n", .{});
+                try self.writer.print(".Lidx_end_{d}:\n", .{label_id});
+                return .string;
+            },
+            .slice => |sl| {
+                const target_kind = try self.generateExpr(sl.target);
+                if (target_kind != .string) return error.SliceRequiresString;
+                self.stack_offset += 16;
+                const ptr_off = self.stack_offset - 8;
+                const len_off = self.stack_offset;
+                try self.writer.print("    mov [rbp - {d}], rax\n", .{ptr_off});
+                try self.writer.print("    mov [rbp - {d}], rdx\n", .{len_off});
+
+                var start_off: i32 = 0;
+                var end_off: i32 = 0;
+
+                if (sl.start) |start_expr| {
+                    const start_kind = try self.generateExpr(start_expr);
+                    if (start_kind != .int) return error.SliceBoundsMustBeInteger;
+                    self.stack_offset += 8;
+                    start_off = self.stack_offset;
+                    try self.writer.print("    mov [rbp - {d}], rax\n", .{start_off});
+                } else {
+                    self.stack_offset += 8;
+                    start_off = self.stack_offset;
+                    try self.writer.print("    mov qword ptr [rbp - {d}], 0\n", .{start_off});
+                }
+
+                if (sl.end) |end_expr| {
+                    const end_kind = try self.generateExpr(end_expr);
+                    if (end_kind != .int) return error.SliceBoundsMustBeInteger;
+                    self.stack_offset += 8;
+                    end_off = self.stack_offset;
+                    try self.writer.print("    mov [rbp - {d}], rax\n", .{end_off});
+                } else {
+                    self.stack_offset += 8;
+                    end_off = self.stack_offset;
+                    try self.writer.print("    mov rax, [rbp - {d}]\n", .{len_off});
+                    try self.writer.print("    mov [rbp - {d}], rax\n", .{end_off});
+                }
+
+                const label_id = self.label_counter;
+                self.label_counter += 1;
+
+                // Normalize and clamp start in rcx.
+                try self.writer.print("    mov rcx, [rbp - {d}]\n", .{start_off});
+                try self.writer.print("    cmp rcx, 0\n", .{});
+                try self.writer.print("    jge .Lslice_start_nonneg_{d}\n", .{label_id});
+                try self.writer.print("    add rcx, [rbp - {d}]\n", .{len_off});
+                try self.writer.print(".Lslice_start_nonneg_{d}:\n", .{label_id});
+                try self.writer.print("    cmp rcx, 0\n", .{});
+                try self.writer.print("    jge .Lslice_start_min_ok_{d}\n", .{label_id});
+                try self.writer.print("    mov rcx, 0\n", .{});
+                try self.writer.print(".Lslice_start_min_ok_{d}:\n", .{label_id});
+                try self.writer.print("    cmp rcx, [rbp - {d}]\n", .{len_off});
+                try self.writer.print("    jle .Lslice_start_max_ok_{d}\n", .{label_id});
+                try self.writer.print("    mov rcx, [rbp - {d}]\n", .{len_off});
+                try self.writer.print(".Lslice_start_max_ok_{d}:\n", .{label_id});
+
+                // Normalize and clamp end in r8.
+                try self.writer.print("    mov r8, [rbp - {d}]\n", .{end_off});
+                try self.writer.print("    cmp r8, 0\n", .{});
+                try self.writer.print("    jge .Lslice_end_nonneg_{d}\n", .{label_id});
+                try self.writer.print("    add r8, [rbp - {d}]\n", .{len_off});
+                try self.writer.print(".Lslice_end_nonneg_{d}:\n", .{label_id});
+                try self.writer.print("    cmp r8, 0\n", .{});
+                try self.writer.print("    jge .Lslice_end_min_ok_{d}\n", .{label_id});
+                try self.writer.print("    mov r8, 0\n", .{});
+                try self.writer.print(".Lslice_end_min_ok_{d}:\n", .{label_id});
+                try self.writer.print("    cmp r8, [rbp - {d}]\n", .{len_off});
+                try self.writer.print("    jle .Lslice_end_max_ok_{d}\n", .{label_id});
+                try self.writer.print("    mov r8, [rbp - {d}]\n", .{len_off});
+                try self.writer.print(".Lslice_end_max_ok_{d}:\n", .{label_id});
+
+                // Ensure end >= start.
+                try self.writer.print("    cmp r8, rcx\n", .{});
+                try self.writer.print("    jge .Lslice_order_ok_{d}\n", .{label_id});
+                try self.writer.print("    mov r8, rcx\n", .{});
+                try self.writer.print(".Lslice_order_ok_{d}:\n", .{label_id});
+
+                // r9 = new length
+                try self.writer.print("    mov r9, r8\n", .{});
+                try self.writer.print("    sub r9, rcx\n", .{});
+
+                self.stack_offset += 16;
+                const norm_start_off = self.stack_offset - 8;
+                const norm_len_off = self.stack_offset;
+                try self.writer.print("    mov [rbp - {d}], rcx\n", .{norm_start_off});
+                try self.writer.print("    mov [rbp - {d}], r9\n", .{norm_len_off});
+
+                // malloc(new_len + 1)
+                try self.writer.print("    mov rdi, [rbp - {d}]\n", .{norm_len_off});
+                try self.writer.print("    add rdi, 1\n", .{});
+                try self.writer.print("    call malloc@PLT\n", .{});
+
+                // memcpy(dest=rax, src=ptr+start, len=new_len)
+                try self.writer.print("    mov rdi, rax\n", .{});
+                try self.writer.print("    mov rsi, [rbp - {d}]\n", .{ptr_off});
+                try self.writer.print("    add rsi, [rbp - {d}]\n", .{norm_start_off});
+                try self.writer.print("    mov rdx, [rbp - {d}]\n", .{norm_len_off});
+                try self.writer.print("    call memcpy@PLT\n", .{});
+
+                // Null terminator + returned logical length in rdx
+                try self.writer.print("    mov rdx, [rbp - {d}]\n", .{norm_len_off});
+                try self.writer.print("    mov byte ptr [rax + rdx], 0\n", .{});
+                return .string;
             },
             .binary => |b| {
                 const left_kind = try self.generateExpr(b.left);
+                var left_ptr_off: i32 = 0;
+                var left_len_off: i32 = 0;
 
                 // Push left operand onto stack (always 8 bytes regardless of type).
                 switch (left_kind) {
@@ -409,18 +839,75 @@ pub const AsmGenerator = struct {
                         try self.writer.print("    sub rsp, 8\n", .{});
                         try self.writer.print("    movsd [rsp], xmm0\n", .{});
                     },
+                    .string => {
+                        self.stack_offset += 16;
+                        left_ptr_off = self.stack_offset - 8;
+                        left_len_off = self.stack_offset;
+                        try self.writer.print("    mov [rbp - {d}], rax\n", .{left_ptr_off});
+                        try self.writer.print("    mov [rbp - {d}], rdx\n", .{left_len_off});
+                    },
                 }
 
                 const right_kind = try self.generateExpr(b.right);
+
+                const has_string = left_kind == .string or right_kind == .string;
+                if (has_string and b.op != .plus) {
+                    return error.UnsupportedStringOperation;
+                }
 
                 // Promote mixed int/float: if one is float, convert the other.
                 const result_kind: RegKind = blk: {
                     switch (b.op) {
                         // Comparisons / logical always produce an int result.
+                        .plus => {
+                            if (has_string) break :blk .string;
+                            break :blk if (left_kind == .float or right_kind == .float) .float else .int;
+                        },
                         .equal_equal, .not_equal, .lt, .gt, .lt_equal, .gt_equal, .kw_and, .kw_or => break :blk .int,
                         else => break :blk if (left_kind == .float or right_kind == .float) .float else .int,
                     }
                 };
+
+                if (result_kind == .string) {
+                    if (left_kind != .string or right_kind != .string) {
+                        return error.StringOperationRequiresStrings;
+                    }
+                    if (b.op != .plus) {
+                        return error.UnsupportedStringOperation;
+                    }
+
+                    self.stack_offset += 16;
+                    const right_ptr_off = self.stack_offset - 8;
+                    const right_len_off = self.stack_offset;
+                    try self.writer.print("    mov [rbp - {d}], rax\n", .{right_ptr_off});
+                    try self.writer.print("    mov [rbp - {d}], rdx\n", .{right_len_off});
+
+                    self.stack_offset += 8;
+                    const dest_ptr_off = self.stack_offset;
+
+                    try self.writer.print("    mov rdi, [rbp - {d}]\n", .{right_len_off});
+                    try self.writer.print("    add rdi, [rbp - {d}]\n", .{left_len_off});
+                    try self.writer.print("    add rdi, 1\n", .{});
+                    try self.writer.print("    call malloc@PLT\n", .{});
+                    try self.writer.print("    mov [rbp - {d}], rax\n", .{dest_ptr_off});
+
+                    try self.writer.print("    mov rdi, [rbp - {d}]\n", .{dest_ptr_off});
+                    try self.writer.print("    mov rsi, [rbp - {d}]\n", .{left_ptr_off});
+                    try self.writer.print("    mov rdx, [rbp - {d}]\n", .{left_len_off});
+                    try self.writer.print("    call memcpy@PLT\n", .{});
+
+                    try self.writer.print("    mov rdi, [rbp - {d}]\n", .{dest_ptr_off});
+                    try self.writer.print("    add rdi, [rbp - {d}]\n", .{left_len_off});
+                    try self.writer.print("    mov rsi, [rbp - {d}]\n", .{right_ptr_off});
+                    try self.writer.print("    mov rdx, [rbp - {d}]\n", .{right_len_off});
+                    try self.writer.print("    call memcpy@PLT\n", .{});
+
+                    try self.writer.print("    mov rax, [rbp - {d}]\n", .{dest_ptr_off});
+                    try self.writer.print("    mov rdx, [rbp - {d}]\n", .{left_len_off});
+                    try self.writer.print("    add rdx, [rbp - {d}]\n", .{right_len_off});
+                    try self.writer.print("    mov byte ptr [rax + rdx], 0\n", .{});
+                    return .string;
+                }
 
                 if (result_kind == .float) {
                     // Pop left into xmm1, ensure right is in xmm0.
@@ -430,6 +917,7 @@ pub const AsmGenerator = struct {
                             try self.writer.print("    cvtsi2sd xmm0, rax\n", .{});
                         },
                         .float => {}, // right already in xmm0
+                        .string => unreachable,
                     }
                     // Pop left → xmm1
                     if (left_kind == .int) {
@@ -604,6 +1092,16 @@ pub const AsmGenerator = struct {
                             try self.writer.print("    movzx rax, al\n", .{});
                         }
                         return .int;
+                    },
+                    .minus => {
+                        if (kind == .float) {
+                            try self.writer.print("    xorpd xmm1, xmm1\n", .{});
+                            try self.writer.print("    subsd xmm1, xmm0\n", .{});
+                            try self.writer.print("    movapd xmm0, xmm1\n", .{});
+                        } else {
+                            try self.writer.print("    neg rax\n", .{});
+                        }
+                        return kind;
                     },
                     else => unreachable,
                 }

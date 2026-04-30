@@ -1,0 +1,7 @@
+s = "hello world"
+print("msg: {}", s)
+print("idx: {}", s[1])
+print("slice: {}", s[0:5])
+print("found: {}", find(s, "world"))
+out = s[6:]
+out
